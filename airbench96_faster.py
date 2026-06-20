@@ -435,10 +435,12 @@ def print_columns(columns_list, is_head=False, is_final_entry=False):
         print('-'*len(print_string))
 
 logging_columns_list = ['run   ', 'epoch', 'train_loss', 'train_acc', 'val_acc', 'tta_val_acc', 'total_time_seconds']
-def print_training_details(variables, is_final_entry):
+def print_training_details(variables, is_final_entry, log_writer):
     formatted = []
+    all_vars = []
     for col in logging_columns_list:
         var = variables.get(col.strip(), None)
+        all_vars.append(var)
         if type(var) in (int, str):
             res = str(var)
         elif type(var) is float:
@@ -447,6 +449,7 @@ def print_training_details(variables, is_final_entry):
             assert var is None
             res = ''
         formatted.append(res.rjust(len(col)))
+    log_writer.writerow(all_vars)
     print_columns(formatted, is_final_entry=is_final_entry)
 
 ############################################
@@ -530,7 +533,7 @@ def train_proxy(hyp, model, data_seed):
 
     return masks
 
-def main(run, hyp, model_proxy, model_trainbias, model_freezebias):
+def main(run, hyp, model_proxy, model_trainbias, model_freezebias, writer):
 
     batch_size = hyp['opt']['batch_size']
     epochs = hyp['opt']['train_epochs']
@@ -663,7 +666,7 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias):
             train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
             train_loss = loss.item() / batch_size
             val_acc = evaluate(model, test_loader, tta_level=0)
-            print_training_details(locals(), is_final_entry=False)
+            print_training_details(locals(), is_final_entry=False, log_writer=writer)
             run = None # Only print the run number once
 
         if current_steps == total_train_steps:
@@ -680,11 +683,18 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias):
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     epoch = 'eval'
-    print_training_details(locals(), is_final_entry=True)
-
+    print_training_details(locals(), is_final_entry=True, log_writer=writer)
+    
     return tta_val_acc
 
 if __name__ == "__main__":
+    import csv
+
+    logfile = open("sgd_results.csv", "w", newline="")
+    writer = csv.writer(logfile)
+
+    writer.writerow(['run   ', 'epoch', 'train_loss', 'train_acc', 'val_acc', 'tta_val_acc', 'total_time_seconds'])
+    
     with open(sys.argv[0]) as f:
         code = f.read()
 
@@ -698,8 +708,8 @@ if __name__ == "__main__":
     model_freezebias = torch.compile(model_freezebias, mode='max-autotune')
 
     print_columns(logging_columns_list, is_head=True)
-    accs = torch.tensor([main(run, hyp, model_proxy, model_trainbias, model_freezebias)
-                         for run in range(200)])
+    accs = torch.tensor([main(run, hyp, model_proxy, model_trainbias, model_freezebias, writer)
+                         for run in range(30)])
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
 
     log = {'code': code, 'accs': accs}
@@ -708,4 +718,6 @@ if __name__ == "__main__":
     log_path = os.path.join(log_dir, 'log.pt')
     print(os.path.abspath(log_path))
     torch.save(log, os.path.join(log_dir, 'log.pt'))
+    logfile.close()
+
 
