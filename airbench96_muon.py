@@ -475,7 +475,7 @@ class Muon(torch.optim.Optimizer):
                 buf = state['momentum_buffer']
                 buf.mul_(momentum).add_(g)
                 g = g.add(buf, alpha=momentum) if group['nesterov'] else buf
-                update = zeropower_via_newtonschulz5(g.reshape(len(g), -1)).view(g.shape)
+                update = zeropower_via_newtonschulz5(g.reshape(len(g), -1), steps=5).view(g.shape)
                 p.data.add_(update, alpha=-lr)
 
 ############################################

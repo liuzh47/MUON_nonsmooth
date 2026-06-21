@@ -59,5 +59,4 @@ plt.legend()
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig('train_loss_vs_epoch_comparison.png', dpi=150)
-plt.show()
 
