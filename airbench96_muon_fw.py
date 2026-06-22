@@ -32,7 +32,7 @@ hyp = {
         'momentum': 0.85,
         'weight_decay': 0.012,   # weight decay per 1024 examples (decoupled from learning rate)
         'bias_scaler': 64.0,     # scales up learning rate (but not weight decay) for BatchNorm biases
-        'muon_lr': 0.15, #0.10, #0.24,         # learning rate for the Muon-handled conv filter weights (separate scale from SGD lr)
+        'muon_lr': 0.24,         # learning rate for the Muon-handled conv filter weights (separate scale from SGD lr)
         'muon_momentum': 0.6,
         'label_smoothing': 0.2,
         'whiten_bias_epochs': 3, # how many epochs to train the whitening layer bias before freezing
@@ -692,7 +692,7 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias, writer):
     param_configs = [dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
                      dict(params=other_params, lr=lr, weight_decay=wd/lr)]
     sgd_trainbias = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
-    muon_trainbias = Muon(muon_params, lr=muon_lr, momentum=hyp['opt']['muon_momentum'], nesterov=True, clip_D=3.0, fw_steps=3, clip_ns_steps=10)
+    muon_trainbias = Muon(muon_params, lr=muon_lr, momentum=hyp['opt']['muon_momentum'], nesterov=True, clip_D=1.0, fw_steps=3, clip_ns_steps=10)
     optimizers_trainbias = [sgd_trainbias, muon_trainbias]
 
     norm_biases = [p for k, p in model_freezebias.named_parameters() if 'norm' in k]
@@ -702,7 +702,7 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias, writer):
     param_configs = [dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
                      dict(params=other_params, lr=lr, weight_decay=wd/lr)]
     sgd_freezebias = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
-    muon_freezebias = Muon(muon_params, lr=muon_lr, momentum=hyp['opt']['muon_momentum'], nesterov=True, clip_D=3.0, fw_steps=3, clip_ns_steps=10)
+    muon_freezebias = Muon(muon_params, lr=muon_lr, momentum=hyp['opt']['muon_momentum'], nesterov=True, clip_D=1.0, fw_steps=3, clip_ns_steps=10)
     optimizers_freezebias = [sgd_freezebias, muon_freezebias]
 
     def get_lr(step):
