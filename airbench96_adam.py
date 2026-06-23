@@ -48,7 +48,7 @@ hyp = {
         'adam_lr': 1e-3,         # base learning rate for non-norm params
         'adam_lr_biases': 1e-2,  # learning rate for BatchNorm bias params (usually higher)
         'adam_betas': (0.9, 0.999),
-        'adam_eps': 1e-8,
+        'adam_eps': 1e-6,        # fp16-safe: default 1e-8 underflows in fp16 (min ~6e-8) → NaN
         'adam_weight_decay': 0.01,  # only meaningful for AdamW (decoupled weight decay)
         # --- shared ---
         'label_smoothing': 0.2,
@@ -496,6 +496,66 @@ class Muon(torch.optim.Optimizer):
                 p.data.add_(update, alpha=-lr)
 
 ############################################
+#          fp32-grad Adam wrapper          #
+############################################
+
+class Fp32GradAdam:
+    """
+    Wrapper around Adam/AdamW that performs the update in fp32 to avoid NaN
+    from fp16 second-moment underflow, while keeping model params in fp16 so
+    torch.compile sees a consistent dtype throughout.
+
+    Strategy (fp32 master-weight lite):
+      - Maintain a fp32 shadow copy of each managed parameter.
+      - On step(): copy fp16 grad → fp32 grad on the shadow param, run Adam
+        on the fp32 shadow, then copy the updated fp32 value back to the
+        original fp16 param.
+    PyTorch requires p.grad.dtype == p.dtype, so we never touch p.grad on the
+    original fp16 tensor — all gradient work happens on the fp32 shadow.
+    """
+    def __init__(self, optimizer):
+        self.optimizer = optimizer
+        self.param_groups = optimizer.param_groups  # kept in sync for schedulers etc.
+        # Build fp32 shadow params and re-point the optimizer's param groups at them.
+        self._fp16_params = []   # original fp16 tensors (model params)
+        self._fp32_shadows = []  # fp32 copies owned by this wrapper
+        for group in self.optimizer.param_groups:
+            fp32_group = []
+            for p in group['params']:
+                shadow = p.detach().float().requires_grad_(p.requires_grad)
+                fp32_group.append(shadow)
+                self._fp16_params.append(p)
+                self._fp32_shadows.append(shadow)
+            group['params'] = fp32_group
+
+    def zero_grad(self, set_to_none=False):
+        # Zero grads on the original fp16 params (where backward writes them).
+        for p in self._fp16_params:
+            if set_to_none:
+                p.grad = None
+            elif p.grad is not None:
+                p.grad.zero_()
+
+    def state_dict(self):
+        return self.optimizer.state_dict()
+
+    def load_state_dict(self, state):
+        self.optimizer.load_state_dict(state)
+
+    def step(self):
+        # 1. Copy fp16 grads → fp32 shadow grads.
+        for p16, p32 in zip(self._fp16_params, self._fp32_shadows):
+            if p16.grad is not None:
+                p32.grad = p16.grad.float()
+            else:
+                p32.grad = None
+        # 2. Run Adam entirely in fp32.
+        self.optimizer.step()
+        # 3. Write fp32 result back into the fp16 model param.
+        for p16, p32 in zip(self._fp16_params, self._fp32_shadows):
+            p16.data.copy_(p32.data)
+
+############################################
 #                 Logging                  #
 ############################################
 
@@ -570,7 +630,10 @@ def train_proxy(hyp, model, data_seed):
         other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
         param_configs = [dict(params=norm_biases,  lr=adam_lr_biases, weight_decay=0.0),
                          dict(params=other_params, lr=adam_lr,        weight_decay=adam_wd)]
-        optimizer = OptCls(param_configs, betas=adam_betas, eps=adam_eps)
+        # Wrap in Fp32GradAdam so gradients are upcast to fp32 before each step.
+        # This keeps model params in fp16 (torch.compile stays happy) while
+        # preventing fp16 underflow in Adam's second-moment accumulator.
+        optimizer = Fp32GradAdam(OptCls(param_configs, betas=adam_betas, eps=adam_eps))
     else:
         raise ValueError(f"Unknown OPTIMIZER: {OPTIMIZER!r}. Choose 'muon_sgd', 'adam_muon', 'adamw_muon', 'adam', or 'adamw'.")
 
@@ -583,7 +646,9 @@ def train_proxy(hyp, model, data_seed):
         else:
             frac = (total_train_steps - step) / warmdown_steps
             return frac
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+    # LambdaLR needs a real torch.optim.Optimizer; unwrap Fp32GradAdam if needed.
+    inner_opt = optimizer.optimizer if isinstance(optimizer, Fp32GradAdam) else optimizer
+    scheduler = torch.optim.lr_scheduler.LambdaLR(inner_opt, get_lr)
 
     # Initialize the whitening layer using training images
     train_images = train_loader.normalize(train_loader.images[:5000])
@@ -691,7 +756,7 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias, writer):
                             if 'norm' not in k and len(p.shape) != 4 and p.requires_grad]
             param_configs = [dict(params=norm_biases,  lr=adam_lr_biases, weight_decay=0.0),
                              dict(params=other_params, lr=adam_lr,        weight_decay=adam_wd)]
-            adam = OptCls(param_configs, betas=adam_betas, eps=adam_eps)
+            adam = Fp32GradAdam(OptCls(param_configs, betas=adam_betas, eps=adam_eps))
             muon = Muon(muon_params, lr=muon_lr, momentum=hyp['opt']['muon_momentum'], nesterov=True)
             return [adam, muon]
         elif OPTIMIZER in ('adam', 'adamw'):
@@ -707,7 +772,7 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias, writer):
                             if 'norm' not in k and p.requires_grad]
             param_configs = [dict(params=norm_biases,  lr=adam_lr_biases, weight_decay=0.0),
                              dict(params=other_params, lr=adam_lr,        weight_decay=adam_wd)]
-            return [OptCls(param_configs, betas=adam_betas, eps=adam_eps)]
+            return [Fp32GradAdam(OptCls(param_configs, betas=adam_betas, eps=adam_eps))]
         else:
             raise ValueError(f"Unknown OPTIMIZER: {OPTIMIZER!r}. "
                              "Choose 'muon_sgd', 'adam_muon', 'adamw_muon', 'adam', or 'adamw'.")
@@ -724,8 +789,11 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias, writer):
         else:
             frac = (total_train_steps - step) / warmdown_steps
             return frac
-    schedulers_trainbias = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers_trainbias]
-    schedulers_freezebias = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers_freezebias]
+    def unwrap(opt):
+        # LambdaLR needs a real torch.optim.Optimizer; unwrap Fp32GradAdam if needed.
+        return opt.optimizer if isinstance(opt, Fp32GradAdam) else opt
+    schedulers_trainbias  = [torch.optim.lr_scheduler.LambdaLR(unwrap(opt), get_lr) for opt in optimizers_trainbias]
+    schedulers_freezebias = [torch.optim.lr_scheduler.LambdaLR(unwrap(opt), get_lr) for opt in optimizers_freezebias]
 
     alpha_schedule = 0.95**5 * (torch.arange(total_train_steps+1) / total_train_steps)**3
     lookahead_state = LookaheadState(model_trainbias)
@@ -834,7 +902,7 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias, writer):
 if __name__ == "__main__":
     import csv
 
-    logfile = open("muon_results.csv", "w", newline="")
+    logfile = open(OPTIMIZER + "_results.csv", "w", newline="")
     writer = csv.writer(logfile)
 
     writer.writerow(['run   ', 'epoch', 'train_loss', 'train_acc', 'val_acc', 'tta_val_acc', 'total_time_seconds'])
