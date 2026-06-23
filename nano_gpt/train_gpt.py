@@ -9,6 +9,7 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'triton_kernels.py'), 'r') 
     code += f.read()
 
 import copy
+import csv
 import glob
 import math
 import threading
@@ -1714,7 +1715,7 @@ class Hyperparameters:
     #   - explicit sparse connectivity refactor (no generic loop)
     #   - (1 + m_r9) * x self-reference fuse on layer 9
     #   - backout_lambda fully removed (slot dropped from self.scalars; absorbed into MUDD bias init)
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = 20  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
@@ -2023,12 +2024,21 @@ if master_process:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
+    csv_path = f"logs/{run_id}.csv"
+    with open(csv_path, "w", newline="") as f:
+        csv.writer(f).writerow(["step", "val_loss", "train_time_ms", "step_avg_ms"])
+
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
             if console:
                 print(s)
             print(s, file=f)
+            
+def log_csv(step, val_loss=None, train_time_ms=None, step_avg_ms=None):
+    if master_process:
+        with open(csv_path, "a", newline="") as f:
+            csv.writer(f).writerow([step, val_loss, train_time_ms, step_avg_ms])
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -2147,6 +2157,7 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        log_csv(step, val_loss=val_loss.item(), train_time_ms=training_time_ms, step_avg_ms=training_time_ms/max(step, 1))
         model.train()
         # start the clock again
         torch.cuda.synchronize()
