@@ -681,7 +681,7 @@ class ParamConfig:
     # Adam step implementation selector: "compiled" (default, unchanged original behavior,
     # cautious weight decay + torch.compile), "no_triton" (same cautious algorithm, plain
     # eager PyTorch), or "adamw" (standard unconditional decoupled weight decay, compiled).
-    adam_method: str = "compiled"
+    adam_method: str = "adam"
     clip_D: float | None = None
 
 
