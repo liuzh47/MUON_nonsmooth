@@ -24,14 +24,15 @@ def load_and_summarize(path, exclude_first_run=True):
 
 results = {
     'Muon':           ('muon_results.csv', 'tab:blue'),
-    'SGD':            ('sgd_results.csv', 'tab:orange'),
-    'Muon SVD':       ('muon_svd_results.csv', 'tab:green'),
-    'Muon Clip SVD':  ('muon_clip_svd_results.csv', 'tab:red'),
+    'SGD':            ('sgd_results.csv', 'tab:orange'),  
     'Muon Clip FW':   ('muon_fw_results.csv', 'tab:purple'),
     'Muon Clip FW exact lr':   ('muon_fw_exact_lr_results.csv', 'tab:pink'),
     'Muon Soft Clip':   ('muon_softclip_results.csv', 'tab:olive'),
+    'Adam Muon':        ('adam_muon_results.csv', 'tab:green'),
 }
 
+#'Muon SVD':       ('muon_svd_results.csv', 'tab:green'),
+#'Muon Clip SVD':  ('muon_clip_svd_results.csv', 'tab:red'),
 # --- Figure 1: train_loss vs total_time_seconds ---
 plt.figure(figsize=(8, 5))
 for label, (path, color) in results.items():

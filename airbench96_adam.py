@@ -29,7 +29,7 @@ torch.backends.cudnn.benchmark = True
 #   'adamw_muon' - AdamW for biases/linear params + Muon for conv filters
 #   'adam'       - Adam for all params (no Muon)
 #   'adamw'      - AdamW for all params (no Muon)
-OPTIMIZER = 'adam_muon'
+OPTIMIZER = 'adam'
 
 hyp = {
     'opt': {
