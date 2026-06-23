@@ -24,12 +24,14 @@ import torchvision.transforms as T
 torch.backends.cudnn.benchmark = True
 
 # Optimizer selection:
-#   'muon_sgd'   - original: SGD for biases/linear params + Muon for conv filters
-#   'adam_muon'  - Adam for biases/linear params + Muon for conv filters
-#   'adamw_muon' - AdamW for biases/linear params + Muon for conv filters
-#   'adam'       - Adam for all params (no Muon)
-#   'adamw'      - AdamW for all params (no Muon)
-OPTIMIZER = 'adam'
+#   'muon_sgd'        - original: SGD for biases/linear params + Muon for conv filters
+#   'adam_muon'       - Adam for biases/linear params + Muon for conv filters
+#   'adamw_muon'      - AdamW for biases/linear params + Muon for conv filters
+#   'adam_muon_soft'  - Adam for biases/linear params + MuonSoftclip for conv filters
+#   'adamw_muon_soft' - AdamW for biases/linear params + MuonSoftclip for conv filters
+#   'adam'            - Adam for all params (no Muon)
+#   'adamw'           - AdamW for all params (no Muon)
+OPTIMIZER = 'adam_muon'
 
 hyp = {
     'opt': {
@@ -44,6 +46,8 @@ hyp = {
         # --- Muon hyperparameters (used when OPTIMIZER contains 'muon') ---
         'muon_lr': 0.24,         # learning rate for the Muon-handled conv filter weights
         'muon_momentum': 0.6,
+        'muon_softclip_D': 1.0,  # soft-clip singular value ceiling (MuonSoftclip only)
+        'muon_softclip_steps': 5,# Newton-Schulz iterations for softclip (MuonSoftclip only)
         # --- Adam / AdamW hyperparameters (used when OPTIMIZER contains 'adam') ---
         'adam_lr': 1e-3,         # base learning rate for non-norm params
         'adam_lr_biases': 1e-2,  # learning rate for BatchNorm bias params (usually higher)
@@ -495,9 +499,76 @@ class Muon(torch.optim.Optimizer):
                 update = zeropower_via_newtonschulz5(g.reshape(len(g), -1), steps=5).view(g.shape)
                 p.data.add_(update, alpha=-lr)
 
-############################################
-#          fp32-grad Adam wrapper          #
-############################################
+@torch.compile
+def softclip_via_newtonschulz(G, D=1.0, steps=5, eps=1e-7):
+    """
+    Soft-clips singular values of G to ≤ D via matrix-inverse-square-root.
+    Unlike zeropower_via_newtonschulz5 (which maps all singular values to ~1),
+    this preserves the relative scale of singular values while capping their
+    maximum at D — hence "soft clip" rather than full orthogonalisation.
+    """
+    assert len(G.shape) == 2
+    X = G.bfloat16()
+    if X.size(0) <= X.size(1):
+        M = X @ X.T        # (rows × rows) — smaller Gram matrix
+        right_side = False
+    else:
+        M = X.T @ X        # (cols × cols) — smaller Gram matrix
+        right_side = True
+    I = torch.eye(M.size(0), device=M.device, dtype=M.dtype)
+    M = M + D * D * I
+    alpha = M.norm() + eps
+    Y = M / alpha
+    Z = I
+    for _ in range(steps):
+        T = 0.5 * (3 * I - Z @ Y)
+        Y = Y @ T
+        Z = T @ Z
+    invsqrt = Z / alpha.sqrt()
+    if right_side:
+        out = D * (X @ invsqrt)
+    else:
+        out = D * (invsqrt @ X)
+    return out.to(G.dtype)
+
+
+class MuonSoftclip(torch.optim.Optimizer):
+    """
+    Muon variant that replaces the Newton-Schulz orthogonalisation step with
+    softclip_via_newtonschulz, which soft-clips singular values to ≤ D rather
+    than mapping them all to ~1. This preserves gradient magnitude ratios while
+    still bounding the maximum update scale, potentially giving smoother training.
+    All other mechanics (momentum buffer, Nesterov, per-step lr) are identical
+    to the standard Muon optimizer.
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 softclip_D=1.0, softclip_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                        softclip_D=softclip_D, softclip_steps=softclip_steps)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            D = group['softclip_D']
+            sc_steps = group['softclip_steps']
+            for p in group['params']:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                g = g.add(buf, alpha=momentum) if group['nesterov'] else buf
+                update = softclip_via_newtonschulz(
+                    g.reshape(len(g), -1), D=D, steps=sc_steps
+                ).view(g.shape)
+                p.data.add_(update, alpha=-lr)
+
+
 
 class Fp32GradAdam:
     """
@@ -619,7 +690,7 @@ def train_proxy(hyp, model, data_seed):
         param_configs = [dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
                          dict(params=other_params, lr=lr, weight_decay=wd/lr)]
         optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
-    elif OPTIMIZER in ('adam', 'adamw', 'adam_muon', 'adamw_muon'):
+    elif OPTIMIZER in ('adam', 'adamw', 'adam_muon', 'adamw_muon', 'adam_muon_soft', 'adamw_muon_soft'):
         adam_lr        = hyp['opt']['adam_lr']
         adam_lr_biases = hyp['opt']['adam_lr_biases']
         adam_betas     = hyp['opt']['adam_betas']
@@ -635,7 +706,7 @@ def train_proxy(hyp, model, data_seed):
         # preventing fp16 underflow in Adam's second-moment accumulator.
         optimizer = Fp32GradAdam(OptCls(param_configs, betas=adam_betas, eps=adam_eps))
     else:
-        raise ValueError(f"Unknown OPTIMIZER: {OPTIMIZER!r}. Choose 'muon_sgd', 'adam_muon', 'adamw_muon', 'adam', or 'adamw'.")
+        raise ValueError(f"Unknown OPTIMIZER: {OPTIMIZER!r}. Choose 'muon_sgd', 'adam_muon', 'adamw_muon', 'adam_muon_soft', 'adamw_muon_soft', 'adam', or 'adamw'.")
 
     def get_lr(step):
         warmup_steps = int(total_train_steps * 0.1)
@@ -727,10 +798,10 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias, writer):
         Returns a list of optimizers so the rest of the training loop (which calls
         `for opt in optimizers: opt.step()`) works unchanged.
 
-        Param split for *_muon modes:
-          - norm params      → Adam/AdamW  (biases/BatchNorm; no Muon)
-          - 4-D conv weights → Muon        (orthogonal update)
-          - other params     → Adam/AdamW  (linear weights, etc.)
+        Param split for *_muon* modes:
+          - norm params      → Adam/AdamW       (biases/BatchNorm; no Muon)
+          - 4-D conv weights → Muon / MuonSoftclip
+          - other params     → Adam/AdamW       (linear weights, etc.)
         """
         if OPTIMIZER == 'muon_sgd':
             norm_biases  = [p for k, p in model.named_parameters() if 'norm' in k]
@@ -742,14 +813,13 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias, writer):
             sgd  = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
             muon = Muon(muon_params, lr=muon_lr, momentum=hyp['opt']['muon_momentum'], nesterov=True)
             return [sgd, muon]
-        elif OPTIMIZER in ('adam_muon', 'adamw_muon'):
+        elif OPTIMIZER in ('adam_muon', 'adamw_muon', 'adam_muon_soft', 'adamw_muon_soft'):
             adam_lr        = hyp['opt']['adam_lr']
             adam_lr_biases = hyp['opt']['adam_lr_biases']
             adam_betas     = hyp['opt']['adam_betas']
             adam_eps       = hyp['opt']['adam_eps']
-            adam_wd        = hyp['opt']['adam_weight_decay'] if OPTIMIZER == 'adamw_muon' else 0.0
-            OptCls = torch.optim.AdamW if OPTIMIZER == 'adamw_muon' else torch.optim.Adam
-            # Conv filters go to Muon; everything else to Adam/AdamW.
+            adam_wd        = hyp['opt']['adam_weight_decay'] if 'adamw' in OPTIMIZER else 0.0
+            OptCls = torch.optim.AdamW if 'adamw' in OPTIMIZER else torch.optim.Adam
             norm_biases  = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
             muon_params  = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
             other_params = [p for k, p in model.named_parameters()
@@ -757,7 +827,13 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias, writer):
             param_configs = [dict(params=norm_biases,  lr=adam_lr_biases, weight_decay=0.0),
                              dict(params=other_params, lr=adam_lr,        weight_decay=adam_wd)]
             adam = Fp32GradAdam(OptCls(param_configs, betas=adam_betas, eps=adam_eps))
-            muon = Muon(muon_params, lr=muon_lr, momentum=hyp['opt']['muon_momentum'], nesterov=True)
+            if 'soft' in OPTIMIZER:
+                muon = MuonSoftclip(muon_params, lr=muon_lr,
+                                    momentum=hyp['opt']['muon_momentum'], nesterov=True,
+                                    softclip_D=hyp['opt']['muon_softclip_D'],
+                                    softclip_steps=hyp['opt']['muon_softclip_steps'])
+            else:
+                muon = Muon(muon_params, lr=muon_lr, momentum=hyp['opt']['muon_momentum'], nesterov=True)
             return [adam, muon]
         elif OPTIMIZER in ('adam', 'adamw'):
             adam_lr        = hyp['opt']['adam_lr']
@@ -775,7 +851,8 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias, writer):
             return [Fp32GradAdam(OptCls(param_configs, betas=adam_betas, eps=adam_eps))]
         else:
             raise ValueError(f"Unknown OPTIMIZER: {OPTIMIZER!r}. "
-                             "Choose 'muon_sgd', 'adam_muon', 'adamw_muon', 'adam', or 'adamw'.")
+                             "Choose 'muon_sgd', 'adam_muon', 'adamw_muon', "
+                             "'adam_muon_soft', 'adamw_muon_soft', 'adam', or 'adamw'.")
 
     optimizers_trainbias  = make_optimizers(model_trainbias)
     optimizers_freezebias = make_optimizers(model_freezebias)
