@@ -2295,7 +2295,7 @@ class TrainingManager():
         adam_defaults = dict(
             lr=0.008,
             eps=1e-10,
-            weight_decay=0.00005,
+            weight_decay=0.005,
         )
 
         normuon_defaults = dict(
