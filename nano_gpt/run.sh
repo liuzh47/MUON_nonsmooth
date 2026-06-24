@@ -1,1 +1,1 @@
-torchrun --standalone --nproc_per_node=4 train_gpt_adamw.py
+torchrun --standalone --nproc_per_node=4 train_gpt_adam.py

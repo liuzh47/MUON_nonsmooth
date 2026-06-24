@@ -517,7 +517,7 @@ def frankwolfe_clip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor
 
 @torch.compile(dynamic=False, fullgraph=True)
 def frankwolfe_linesearch_clip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
-                                     clip_D_t: torch.Tensor, fw_steps: int = 5, ns_steps: int = 10,
+                                     clip_D_t: torch.Tensor, fw_steps: int = 20, ns_steps: int = 10,
                                      split_baddbmm: bool = False, eps: float = 1e-12):
     """
     Fused Nesterov momentum + spectral clip via Frank-Wolfe with exact line search.
@@ -677,7 +677,7 @@ class ParamConfig:
     # unchanged original behavior), "vanilla_muon", "vanilla_muon_no_triton", "softclip"
     # (requires clip_D), "frankwolfe" (also requires clip_D), or "frankwolfe_linesearch"
     # (also requires clip_D; same as "frankwolfe" but with exact line search step sizes).
-    orth_method: str = "frankwolfe_linesearch"
+    orth_method: str = "vanilla_muon_no_triton"
     # Adam step implementation selector: "compiled" (default, unchanged original behavior,
     # cautious weight decay + torch.compile), "no_triton" (same cautious algorithm, plain
     # eager PyTorch), or "adamw" (standard unconditional decoupled weight decay, compiled).
@@ -851,7 +851,7 @@ class NorMuonAndAdam:
                 momentum=self.normuon_defaults["momentum"],
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
-                clip_D=1.0,
+                clip_D=1,
             )
         else:
             raise ValueError(f"Unknown optim type: {optim}")

@@ -2253,9 +2253,9 @@ class TrainingManager():
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
-            "qk_bank":        {"optim": "adam", "comms": "sharded",    "adam_betas": [0.9,  0.95]},
-            "vo_bank":        {"optim": "adam", "comms": "sharded",    "adam_betas": [0.9,  0.95]},
-            "mlp_bank":       {"optim": "adam", "comms": "sharded",    "adam_betas": [0.9,  0.95]},
+            "qk_bank":        {"optim": "adam", "comms": "sharded",    "adam_betas": [0.9,  0.95], "lr_mul": 0.1,  "wd_mul": 1.0},
+            "vo_bank":        {"optim": "adam", "comms": "sharded",    "adam_betas": [0.9,  0.95], "lr_mul": 0.1,  "wd_mul": 1.0},
+            "mlp_bank":       {"optim": "adam", "comms": "sharded",    "adam_betas": [0.9,  0.95], "lr_mul": 0.1,  "wd_mul": 1.0},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},

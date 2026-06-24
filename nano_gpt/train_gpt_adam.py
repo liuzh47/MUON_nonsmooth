@@ -517,7 +517,7 @@ def frankwolfe_clip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor
 
 @torch.compile(dynamic=False, fullgraph=True)
 def frankwolfe_linesearch_clip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
-                                     clip_D_t: torch.Tensor, fw_steps: int = 5, ns_steps: int = 10,
+                                     clip_D_t: torch.Tensor, fw_steps: int = 20, ns_steps: int = 10,
                                      split_baddbmm: bool = False, eps: float = 1e-12):
     """
     Fused Nesterov momentum + spectral clip via Frank-Wolfe with exact line search.
@@ -677,11 +677,11 @@ class ParamConfig:
     # unchanged original behavior), "vanilla_muon", "vanilla_muon_no_triton", "softclip"
     # (requires clip_D), "frankwolfe" (also requires clip_D), or "frankwolfe_linesearch"
     # (also requires clip_D; same as "frankwolfe" but with exact line search step sizes).
-    orth_method: str = "frankwolfe_linesearch"
+    orth_method: str = "polar_express"
     # Adam step implementation selector: "compiled" (default, unchanged original behavior,
     # cautious weight decay + torch.compile), "no_triton" (same cautious algorithm, plain
     # eager PyTorch), or "adamw" (standard unconditional decoupled weight decay, compiled).
-    adam_method: str = "adam"
+    adam_method: str = "compiled"
     clip_D: float | None = None
 
 
@@ -851,7 +851,6 @@ class NorMuonAndAdam:
                 momentum=self.normuon_defaults["momentum"],
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
-                clip_D=1.0,
             )
         else:
             raise ValueError(f"Unknown optim type: {optim}")
@@ -2243,9 +2242,9 @@ class TrainingManager():
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
-            "qk_bank":        {"optim": "adam", "comms": "sharded",    "adam_betas": [0.9,  0.95]},
-            "vo_bank":        {"optim": "adam", "comms": "sharded",    "adam_betas": [0.9,  0.95]},
-            "mlp_bank":       {"optim": "adam", "comms": "sharded",    "adam_betas": [0.9,  0.95]},
+            "qk_bank":  {"optim": "adam", "comms": "sharded", "adam_betas": [0.9, 0.99], "lr_mul": 0.1,  "wd_mul": 1.0},  # was normuon
+            "vo_bank":  {"optim": "adam", "comms": "sharded", "adam_betas": [0.9, 0.99], "lr_mul": 0.1,  "wd_mul": 1.0},  # was normuon
+            "mlp_bank": {"optim": "adam", "comms": "sharded", "adam_betas": [0.9, 0.99], "lr_mul": 0.1,  "wd_mul": 0.0},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
@@ -2583,6 +2582,7 @@ for step in range(train_steps + 1):
         training_manager.sparse_index_share(step)
         loss.backward()
         del loss
+    
     training_manager.step_optimizers(step)
     model.quantize_mlp_fp8()
 
