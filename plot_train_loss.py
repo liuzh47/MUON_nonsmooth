@@ -28,8 +28,8 @@ results = {
     'Adam':             ('adam_results.csv', 'tab:red'),
     'AdamW':            ('adamw_results.csv', 'tab:cyan'),
     'Adam Soft Clip':   ('adam_muon_soft_results.csv', 'tab:brown'),
-    'Adam FW':          ('adam_muon_fw_results.csv', 'tab:olive')
-    'Adam SVD clip':          ('adam_muon_svd_results.csv', 'tab:pink')
+    'Adam FW':          ('adam_muon_fw_results.csv', 'tab:olive'),
+    'Adam SVD clip':          ('adam_muon_svd_results.csv', 'tab:pink'),
 }
 #'Muon Clip FW':   ('muon_fw_results.csv', 'tab:purple'),
 #'Muon Clip FW exact lr':   ('muon_fw_exact_lr_results.csv', 'tab:pink'),

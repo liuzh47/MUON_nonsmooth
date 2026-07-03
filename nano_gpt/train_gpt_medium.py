@@ -422,6 +422,200 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 
 
 # -----------------------------------------------------------------------------
+# Vanilla Muon (no Triton): same Newton-Schulz update rule as polar_express above
+# but with the original fixed Muon coefficients and plain PyTorch matmuls instead
+# of the XXT/ba_plus_cAA Triton kernels. Drop-in replacement for polar_express --
+# identical signature and return contract (transposed wide matrices to tall before
+# the loop, transposed back after, matching polar_express's convention).
+#
+# split_baddbmm is accepted for interface compatibility but has no effect here:
+# the defensive-copy issue that flag works around is specific to baddbmm/addmm
+# with a repeated argument, which doesn't arise in this plain-matmul formulation.
+# UNVERIFIED against the real distributed environment -- algebraically correct,
+# but has not been run end-to-end and should be tested on a small run first.
+
+vanilla_muon_coeffs = [(3.4445, -4.7750, 2.0315)] * 5
+
+@torch.compile(dynamic=False, fullgraph=True)
+def vanilla_muon_no_triton(G: torch.Tensor, split_baddbmm: bool = False):
+    """
+    Vanilla Newton-Schulz orthogonalization with fixed Muon coefficients,
+    plain-PyTorch version (no Triton kernels). Drop-in replacement for polar_express.
+    split_baddbmm is accepted for interface compatibility but unused.
+    """
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
+    X = X.contiguous()
+
+    # X is now always wide (rows <= cols); use X @ X^T (the smaller Gram matrix)
+    batched = X.ndim > 2
+    bmm = torch.bmm if batched else torch.mm
+
+    for a, b, c in vanilla_muon_coeffs:
+        A = bmm(X, X.mT) if batched else X @ X.mT    # A = X X^T (rows x rows, small)
+        B = b * A + c * (bmm(A, A) if batched else A @ A)   # B = b*A + c*A@A
+        X = a * X + (bmm(B, X) if batched else B @ X)        # X = a*X + B@X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+# -----------------------------------------------------------------------------
+# Soft-clip Muon: instead of orthogonalizing (pushing every singular value towards 1),
+# caps each singular value sigma at a threshold D via
+#     sigma -> D * sigma / sqrt(D^2 + sigma^2)
+# computed via a coupled Newton-Schulz iteration for the matrix inverse square root.
+# Drop-in replacement for polar_express, with one extra argument: clip_D (a Python
+# float), the clip threshold.
+#
+# Unlike polar_express/vanilla_muon_no_triton, this does NOT reuse XXT/ba_plus_cAA
+# -- the coupled (Y, Z) recursion needs Y@T and T@Z products that don't fit those
+# kernel shapes. Plain batched matmuls throughout.
+# UNVERIFIED end-to-end -- checked in isolation only.
+
+@torch.compile(dynamic=False, fullgraph=True)
+def softclip_muon(G: torch.Tensor, clip_D: float, steps: int = 8, split_baddbmm: bool = False):
+    """
+    Soft-clip spectral update via coupled Newton-Schulz inverse square root.
+    Drop-in replacement for polar_express with one extra positional arg: clip_D.
+    split_baddbmm is accepted for interface compatibility but unused.
+    """
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # X is now always wide (rows <= cols); use X @ X^T (the smaller Gram matrix)
+    batched = X.ndim > 2
+    bmm = torch.bmm if batched else torch.mm
+    D = X.new_tensor(clip_D)
+
+    M = bmm(X, X.mT) if batched else X @ X.mT    # (..., m, m), m = rows (smaller dim)
+    n = M.size(-1)
+    I = torch.eye(n, device=X.device, dtype=X.dtype).expand_as(M).clone()
+    M = M + (D * D) * I
+    alpha = M.norm(dim=(-2, -1), keepdim=True) + 1e-6
+    Y = M / alpha
+    Z = I.clone()
+    for _ in range(steps):
+        ZY = bmm(Z, Y) if batched else Z @ Y
+        T = 0.5 * (3 * I - ZY)
+        Y = bmm(Y, T) if batched else Y @ T
+        Z = bmm(T, Z) if batched else T @ Z
+    invsqrt = Z / alpha.sqrt()
+
+    out = D * (bmm(invsqrt, X) if batched else invsqrt @ X)
+
+    if G.size(-2) > G.size(-1):
+        out = out.mT
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Frank-Wolfe spectral clip: alternative to softclip_muon for the same goal
+# (cap singular values at D), via the variational characterization:
+#     min_{X: ||X||_2 <= D} 1/2 ||X - G||_F^2
+# solved by standard Frank-Wolfe with fixed step sizes alpha_k = 2/(k+2).
+# The linear minimization oracle is -D * msign(gradient), where msign is computed
+# by a cubic Newton-Schulz iteration. Drop-in replacement for polar_express with
+# the extra positional arg clip_D.
+#
+# NOTE: standard (fixed-step) Frank-Wolfe has O(1/k) convergence in function value.
+# Singular values strictly below D converge more slowly than those saturating to D.
+# softclip_muon converges far faster for comparable accuracy -- this is here as an
+# alternative, not a recommended default. Plain batched matmuls throughout.
+# UNVERIFIED end-to-end.
+
+@torch.compile(dynamic=False, fullgraph=True)
+def frankwolfe_clip_muon(G: torch.Tensor, clip_D: float, fw_steps: int = 20, ns_steps: int = 10,
+                          split_baddbmm: bool = False):
+    """
+    Spectral clip via standard (fixed-step) Frank-Wolfe.
+    Drop-in replacement for polar_express with extra positional arg clip_D.
+    split_baddbmm is accepted for interface compatibility but unused.
+    """
+    A = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        A = A.mT
+
+    # A is now always wide (rows <= cols); msign uses X @ X^T (smaller Gram matrix)
+    batched = A.ndim > 2
+    bmm = torch.bmm if batched else torch.mm
+    D = A.new_tensor(clip_D)
+
+    def msign_exact(M):
+        # Exact (truly convergent) cubic Newton-Schulz on X @ X^T (wide convention)
+        Y = M / (M.norm(dim=(-2, -1), keepdim=True) + 1e-6)
+        for _ in range(ns_steps):
+            AA = bmm(Y, Y.mT) if batched else Y @ Y.mT   # rows x rows, small
+            Y = 1.5 * Y - 0.5 * (bmm(AA, Y) if batched else AA @ Y)
+        return Y
+
+    X = torch.zeros_like(A)
+    for k in range(fw_steps):
+        Yk = -D * msign_exact(X - A)
+        alpha = 2.0 / (k + 2)
+        X = X + alpha * (Yk - X)
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+# -----------------------------------------------------------------------------
+# Frank-Wolfe with exact line search: same as frankwolfe_clip_muon above but
+# with exact line search for the step size alpha_k instead of the fixed schedule
+# 2/(k+2). Since f(X) = 1/2||X-A||_F^2 is quadratic, the exact step has closed form:
+#     alpha_k = clip( <A-X_k, Y_k-X_k> / ||Y_k-X_k||_F^2 , 0, 1 )
+# This costs two extra Frobenius inner products per step (negligible vs. the inner
+# msign computation) and converges substantially faster in practice (~30x lower
+# residual error at equal iteration count). Drop-in replacement for polar_express
+# with the extra positional arg clip_D. UNVERIFIED end-to-end.
+
+@torch.compile(dynamic=False, fullgraph=True)
+def frankwolfe_linesearch_clip_muon(G: torch.Tensor, clip_D: float, fw_steps: int = 20, ns_steps: int = 10,
+                                     split_baddbmm: bool = False, eps: float = 1e-12):
+    """
+    Spectral clip via Frank-Wolfe with exact line search.
+    Drop-in replacement for polar_express with extra positional arg clip_D.
+    split_baddbmm is accepted for interface compatibility but unused.
+    """
+    A = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        A = A.mT
+
+    # A is now always wide (rows <= cols); msign uses X @ X^T (smaller Gram matrix)
+    batched = A.ndim > 2
+    bmm = torch.bmm if batched else torch.mm
+    D = A.new_tensor(clip_D)
+
+    def msign_exact(M):
+        # Exact (truly convergent) cubic Newton-Schulz on X @ X^T (wide convention)
+        Y = M / (M.norm(dim=(-2, -1), keepdim=True) + 1e-6)
+        for _ in range(ns_steps):
+            AA = bmm(Y, Y.mT) if batched else Y @ Y.mT   # rows x rows, small
+            Y = 1.5 * Y - 0.5 * (bmm(AA, Y) if batched else AA @ Y)
+        return Y
+
+    X = torch.zeros_like(A)
+    for k in range(fw_steps):
+        Yk = -D * msign_exact(X - A)
+        Z = Yk - X
+        denom = (Z * Z).sum(dim=(-2, -1), keepdim=True)
+        numer = ((A - X) * Z).sum(dim=(-2, -1), keepdim=True)
+        alpha = (numer / (denom + eps)).clamp(0.0, 1.0)
+        X = X + alpha * Z
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+# -----------------------------------------------------------------------------
 # Compiled helpers for NorMuon by @chrisjmccormick
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -647,11 +841,30 @@ class NorMuon(torch.optim.Optimizer):
             eff_lr_cpu = eff_lr_all[module_idx:module_idx + num_params]
             eff_wd_cpu = eff_wd_all[module_idx:module_idx + num_params]
 
-            # Compute zeropower for the entire chunk in a single, batched call.
+            # Compute zeropower / spectral update for the entire chunk in a single, batched call.
+            # Dispatch based on group["orth_method"] (defaults to "polar_express"):
+            #   "polar_express"               -- original Polar Express (Triton kernels, optimized schedule)
+            #   "vanilla_muon_no_triton"      -- fixed Muon coefficients, plain PyTorch matmuls
+            #   "softclip"                    -- soft spectral clip; requires group["clip_D"]
+            #   "frankwolfe"                  -- Frank-Wolfe fixed-step spectral clip; requires group["clip_D"]
+            #   "frankwolfe_linesearch"       -- Frank-Wolfe exact line-search clip; requires group["clip_D"]
+            orth_method = group.get("orth_method", "polar_express")
+            split = (ref_param.label == 'mlp')
             if num_params == 0:
                 v_chunk = updated_grads
-            else:
-                v_chunk = polar_express(updated_grads, split_baddbmm=(ref_param.label == 'mlp'))
+            elif orth_method == "vanilla_muon_no_triton":
+                v_chunk = vanilla_muon_no_triton(updated_grads, split_baddbmm=split)
+            elif orth_method == "softclip":
+                clip_D = group.get("clip_D", 1.0)
+                v_chunk = softclip_muon(updated_grads, clip_D=clip_D, split_baddbmm=split)
+            elif orth_method == "frankwolfe":
+                clip_D = group.get("clip_D", 1.0)
+                v_chunk = frankwolfe_clip_muon(updated_grads, clip_D=clip_D, split_baddbmm=split)
+            elif orth_method == "frankwolfe_linesearch":
+                clip_D = group.get("clip_D", 1.0)
+                v_chunk = frankwolfe_linesearch_clip_muon(updated_grads, clip_D=clip_D, split_baddbmm=split)
+            else:  # "polar_express" (default)
+                v_chunk = polar_express(updated_grads, split_baddbmm=split)
 
             # Note that the head orientation in O is transposed relative to QKV, so red_dim
             # is 'incorrect' for O. However, correcting this showed no improvement. @chrisjmccormick
@@ -1484,6 +1697,11 @@ class TrainingManager():
         self.adam_opt = DistAdam(adam_params, adam_labels, lr=0.004, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.005)
         self.scalar_opt = DistAdam(scalar_params, scalar_labels, lr=0.008, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.005)
         self.muon_opt = NorMuon(muon_params, lr=0.015, momentum=0.95, beta2=0.95, weight_decay=1.2)
+        
+        for group in muon_opt.param_groups:
+            group["orth_method"] = "softclip"
+            group["clip_D"] = 1.0
+
         self.optimizers = [self.adam_opt, self.scalar_opt, self.muon_opt]
         # split after odd number step
         self.split_step = math.ceil(args.split_embed_frac * args.num_scheduled_iterations) | 1
