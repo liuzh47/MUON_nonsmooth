@@ -441,9 +441,13 @@ def softclip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
 # for the SAME goal (cap singular values at D), via the variational characterization instead:
 #     min_{X: ||X||_2 <= D} 1/2 ||X - G||_F^2
 # solved by standard Frank-Wolfe with the FIXED step size schedule alpha_k = 2/(k+2) (NOT
-# exact line search). The linear minimization oracle over a spectral-norm ball has closed
-# form -D * msign(gradient), so each outer FW step is just one polar-factor computation on
-# the current residual X_k - G.
+# exact line search). The linear minimization oracle (LMO) over a spectral-norm ball returns
+# -D * u1 @ v1.T, where u1/v1 are the top left/right singular vectors of the current gradient
+# G = X_k - A. These are computed via power iteration (pi_steps steps of G @ v, G.T @ u with
+# renormalization) rather than the earlier Newton-Schulz matrix-sign approach: power iteration
+# only needs two matrix-vector products per step and produces only the single rank-1 outer
+# product needed by the LMO, whereas Newton-Schulz computes the full matrix sign over all
+# singular values (unnecessary when only the top pair is required).
 #
 # IMPORTANT, verified empirically in the conversation that produced this: standard
 # (fixed-step) Frank-Wolfe only has O(1/k) convergence in function value / O(1/sqrt(k)) in
@@ -463,7 +467,7 @@ def softclip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
 
 @torch.compile(dynamic=False, fullgraph=True)
 def frankwolfe_clip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
-                          clip_D_t: torch.Tensor, fw_steps: int = 20, ns_steps: int = 10,
+                          clip_D_t: torch.Tensor, fw_steps: int = 20, pi_steps: int = 10,
                           split_baddbmm: bool = False):
     """
     Fused Nesterov momentum + spectral clip via standard (fixed-step) Frank-Wolfe.
@@ -471,6 +475,13 @@ def frankwolfe_clip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor
     clip_D_t argument as softclip_muon (the clip threshold D, as a 0-D CPU tensor to avoid
     recompilation). split_baddbmm is accepted for interface compatibility but unused, same
     as in softclip_muon.
+
+    The LMO over the spectral-norm ball is -D * u1 @ v1.T, where u1/v1 are the top left/right
+    singular vectors of the gradient G = X - A. These are computed via power iteration
+    (pi_steps steps) rather than Newton-Schulz: power iteration only needs two matrix-vector
+    products per step (G @ v and G.T @ u) and a scalar renormalization, vs. Newton-Schulz's
+    full Gram matrix product (G.T @ G or G @ G.T) at every step, making it substantially
+    cheaper per LMO call when only the top singular pair is needed.
     """
     momentum = momentum_t.to(grad_chunk.dtype)
     momentum_buffer.lerp_(grad_chunk, 1 - momentum)
@@ -479,24 +490,27 @@ def frankwolfe_clip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor
     A = g.bfloat16()
     is_tall = A.size(-2) > A.size(-1)
     batched = A.ndim > 2
-    bmm = torch.bmm if batched else torch.mm
     D = clip_D_t.to(A.dtype)
 
-    def msign_exact(M):
-        # Exact (truly convergent) cubic Newton-Schulz, on whichever Gram matrix is smaller.
-        Y = M / (M.norm(dim=(-2, -1), keepdim=True) + 1e-6)
-        for _ in range(ns_steps):
-            if is_tall:
-                AA = bmm(Y.mT, Y) if batched else Y.mT @ Y   # cols x cols, small
-                Y = 1.5 * Y - 0.5 * (bmm(Y, AA) if batched else Y @ AA)
-            else:
-                AA = bmm(Y, Y.mT) if batched else Y @ Y.mT   # rows x rows, small
-                Y = 1.5 * Y - 0.5 * (bmm(AA, Y) if batched else AA @ Y)
-        return Y
+    def top1_svd(M):
+        # Power iteration for the top-1 singular pair of M (shape ..., m, n).
+        # Each step: v <- M.T @ u (right singular vector), u <- M @ v (left singular vector),
+        # both L2-normalised. Two cheap matrix-vector products per step; no Gram matrix formed.
+        m, n = M.size(-2), M.size(-1)
+        # Initialise v as a unit vector along the first column direction
+        v = M.new_zeros(*M.shape[:-2], n, 1)
+        v[..., 0, 0] = 1.0
+        for _ in range(pi_steps):
+            u = (torch.bmm(M, v) if batched else M @ v)            # (..., m, 1)
+            u = u / (u.norm(dim=-2, keepdim=True) + 1e-6)
+            v = (torch.bmm(M.mT, u) if batched else M.mT @ u)      # (..., n, 1)
+            v = v / (v.norm(dim=-2, keepdim=True) + 1e-6)
+        # Rank-1 outer product: u1 @ v1.T  (shape ..., m, n)
+        return torch.bmm(u, v.mT) if batched else u @ v.mT
 
     X = torch.zeros_like(A)
     for k in range(fw_steps):
-        Yk = -D * msign_exact(X - A)
+        Yk = -D * top1_svd(X - A)
         alpha = 2.0 / (k + 2)
         X = X + alpha * (Yk - X)
     return X
@@ -517,7 +531,7 @@ def frankwolfe_clip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor
 
 @torch.compile(dynamic=False, fullgraph=True)
 def frankwolfe_linesearch_clip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
-                                     clip_D_t: torch.Tensor, fw_steps: int = 20, ns_steps: int = 10,
+                                     clip_D_t: torch.Tensor, fw_steps: int = 20, pi_steps: int = 10,
                                      split_baddbmm: bool = False, eps: float = 1e-12):
     """
     Fused Nesterov momentum + spectral clip via Frank-Wolfe with exact line search.
@@ -525,6 +539,12 @@ def frankwolfe_linesearch_clip_muon(grad_chunk: torch.Tensor, momentum_buffer: t
     same signature pattern (clip_D_t as a 0-D CPU tensor, like softclip_muon/
     frankwolfe_clip_muon). split_baddbmm is accepted for interface compatibility but unused,
     same as the other plain-matmul variants above.
+
+    The LMO uses power iteration (pi_steps steps) to find the top-1 singular pair, replacing
+    the previous Newton-Schulz matrix-sign computation. This is cheaper because power iteration
+    only performs two matrix-vector products per step (G @ v and G.T @ u) and produces only the
+    single rank-1 outer product u1 @ v1.T needed for the LMO, instead of computing the full
+    matrix sign over all singular values.
     """
     momentum = momentum_t.to(grad_chunk.dtype)
     momentum_buffer.lerp_(grad_chunk, 1 - momentum)
@@ -533,24 +553,26 @@ def frankwolfe_linesearch_clip_muon(grad_chunk: torch.Tensor, momentum_buffer: t
     A = g.bfloat16()
     is_tall = A.size(-2) > A.size(-1)
     batched = A.ndim > 2
-    bmm = torch.bmm if batched else torch.mm
     D = clip_D_t.to(A.dtype)
 
-    def msign_exact(M):
-        # Exact (truly convergent) cubic Newton-Schulz, on whichever Gram matrix is smaller.
-        Y = M / (M.norm(dim=(-2, -1), keepdim=True) + 1e-6)
-        for _ in range(ns_steps):
-            if is_tall:
-                AA = bmm(Y.mT, Y) if batched else Y.mT @ Y   # cols x cols, small
-                Y = 1.5 * Y - 0.5 * (bmm(Y, AA) if batched else Y @ AA)
-            else:
-                AA = bmm(Y, Y.mT) if batched else Y @ Y.mT   # rows x rows, small
-                Y = 1.5 * Y - 0.5 * (bmm(AA, Y) if batched else AA @ Y)
-        return Y
+    def top1_svd(M):
+        # Power iteration for the top-1 singular pair of M (shape ..., m, n).
+        # Each step: u <- M @ v (left singular vector), v <- M.T @ u (right singular vector),
+        # both L2-normalised. Two cheap matrix-vector products per step; no Gram matrix formed.
+        m, n = M.size(-2), M.size(-1)
+        v = M.new_zeros(*M.shape[:-2], n, 1)
+        v[..., 0, 0] = 1.0
+        for _ in range(pi_steps):
+            u = (torch.bmm(M, v) if batched else M @ v)            # (..., m, 1)
+            u = u / (u.norm(dim=-2, keepdim=True) + 1e-6)
+            v = (torch.bmm(M.mT, u) if batched else M.mT @ u)      # (..., n, 1)
+            v = v / (v.norm(dim=-2, keepdim=True) + 1e-6)
+        # Rank-1 outer product: u1 @ v1.T  (shape ..., m, n)
+        return torch.bmm(u, v.mT) if batched else u @ v.mT
 
     X = torch.zeros_like(A)
     for k in range(fw_steps):
-        Yk = -D * msign_exact(X - A)
+        Yk = -D * top1_svd(X - A)
         Z = Yk - X
         denom = (Z * Z).sum(dim=(-2, -1), keepdim=True)
         numer = ((A - X) * Z).sum(dim=(-2, -1), keepdim=True)
@@ -673,11 +695,11 @@ class ParamConfig:
     momentum: float | None = None
     beta2: float | None = None
     per_matrix_lr_mul: list[float] | None = None
-    # Orthogonalization method selector for NorMuon params: "polar_express" (default,
-    # unchanged original behavior), "vanilla_muon", "vanilla_muon_no_triton", "softclip"
-    # (requires clip_D), "frankwolfe" (also requires clip_D), or "frankwolfe_linesearch"
-    # (also requires clip_D; same as "frankwolfe" but with exact line search step sizes).
-    orth_method: str = "vanilla_muon_no_triton"
+    # Orthogonalization method selector for NorMuon params: "polar_express" (original
+    # behavior), "vanilla_muon", "vanilla_muon_no_triton", "softclip" (requires clip_D),
+    # "frankwolfe" (also requires clip_D), or "frankwolfe_linesearch" (also requires
+    # clip_D; same as "frankwolfe" but with exact line search step sizes -- current default).
+    orth_method: str = "frankwolfe_linesearch"
     # Adam step implementation selector: "compiled" (default, unchanged original behavior,
     # cautious weight decay + torch.compile), "no_triton" (same cautious algorithm, plain
     # eager PyTorch), or "adamw" (standard unconditional decoupled weight decay, compiled).
@@ -836,6 +858,17 @@ class NorMuonAndAdam:
                     is_c_proj = (global_idx % 2 == 1)
                     per_matrix_lr_mul.append(2.0 if is_c_proj else 1.0)
 
+            # Allow per-entry orth_method/clip_D overrides from the param table (e.g. set
+            # directly in TrainingManager.param_table for specific labels); fall back to
+            # the ParamConfig field default if not present in the table.
+            orth_method = table_entry.get("orth_method", "frankwolfe_linesearch")
+            clip_D = table_entry.get("clip_D", None)
+            # clip_D=None means auto: use min(m, n) of this param's matrix shape. This
+            # scales the spectral-norm ball so it contains the unit nuclear-norm ball,
+            # making FW at convergence consistent with Muon's all-singular-values-1 target.
+            if clip_D is None:
+                clip_D = float(min(chunk_shape[-2], chunk_shape[-1]))
+
             p_cfg = ParamConfig(
                 label=label,
                 optim=optim,
@@ -851,7 +884,8 @@ class NorMuonAndAdam:
                 momentum=self.normuon_defaults["momentum"],
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
-                clip_D=1,
+                orth_method=orth_method,
+                clip_D=clip_D,
             )
         else:
             raise ValueError(f"Unknown optim type: {optim}")
@@ -1243,8 +1277,8 @@ class NorMuonAndAdam:
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
         # Fused Nesterov momentum + orthogonalization (or soft-clip) step.
-        # orth_method defaults to "polar_express" for every existing ParamConfig, so this
-        # dispatch is a no-op unless a config explicitly opts into one of the alternatives.
+        # orth_method defaults to "frankwolfe_linesearch" for every existing ParamConfig;
+        # set orth_method="polar_express" (or any other value below) to opt into an alternative.
         is_large_matrix = chunk_shape[-2] > 1024
         if p_cfg.orth_method == "vanilla_muon":
             v_chunk = vanilla_muon(
@@ -2457,7 +2491,6 @@ def nvidia_smi():
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
-
 model: nn.Module = GPT(
     vocab_size=50257,
     num_layers=11,
