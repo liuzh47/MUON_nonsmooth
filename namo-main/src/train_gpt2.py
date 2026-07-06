@@ -23,6 +23,7 @@ from omegaconf import DictConfig, OmegaConf
 from hydra.utils import get_original_cwd
 from muon import Muon
 from namo import NAMO, NAMO_D
+from softclip_muon import SoftClipMuon
 
 # system configs
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -102,6 +103,14 @@ def configure_optimizers(model, cfg, device_type):
                     kwargs["col_state_clamp_c"] = cfg.col_state_clamp_c
                 optimizer = NAMO_D(**kwargs)
                 print("using NAMO-D optimizer")
+
+            case "softclip_muon":
+                if "clip_D" in cfg:
+                    kwargs["clip_D"] = cfg.clip_D
+                if "ns_steps" in cfg:
+                    kwargs["ns_steps"] = cfg.ns_steps
+                optimizer = SoftClipMuon(**kwargs)
+                print("using SoftClip Muon optimizer")
 
             case _:
                 raise ValueError(f"Unknown muon optimizer type: {cfg.type}")
