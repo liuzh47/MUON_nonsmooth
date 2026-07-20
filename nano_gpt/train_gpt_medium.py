@@ -18,6 +18,7 @@ import gc
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
+
 torch.empty(
     1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
 ).backward()  # prevents a bug on some systems
@@ -926,9 +927,17 @@ class NorMuon(torch.optim.Optimizer):
 
 
 class DistAdam(torch.optim.Optimizer):
-    def __init__(self, params, label_order: list[str],lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
+    def __init__(self, params, label_order: list[str], lr: float = 1e-3,
+                 betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8,
+                 weight_decay: float = 0.01, standard_adamw: bool = False):
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            standard_adamw=standard_adamw,
+        )
         params = list(params)
         # Group by label, with explicit ordering for execution control.
         params_by_label = defaultdict(list)
@@ -981,8 +990,13 @@ class DistAdam(torch.optim.Optimizer):
 
     def copy_lm_to_embed(self):
         # run at 1/6 of training
-        lm_head = self.param_groups[0]['params'][0]
-        embed = self.param_groups[-1]['params'][0]
+        params = [p for group in self.param_groups for p in group['params']]
+        lm_heads = [p for p in params if getattr(p, 'label', None) == 'lm_head']
+        embeds = [p for p in params if getattr(p, 'label', None) == 'embed']
+        assert len(lm_heads) == 1, f"Expected one lm_head parameter, found {len(lm_heads)}"
+        assert len(embeds) == 1, f"Expected one embed parameter, found {len(embeds)}"
+        lm_head = lm_heads[0]
+        embed = embeds[0]
         lm_head_state = self.state[lm_head]
         embed_state = self.state[embed]
         embed_state['step'] = lm_head_state['step']
@@ -1000,6 +1014,7 @@ class DistAdam(torch.optim.Optimizer):
             beta1, beta2 = group['betas']
             eps = group['eps']
             wd = group['weight_decay']
+            standard_adamw = group['standard_adamw']
             for param in group['params']:
                 if param not in self._reduce_scatter_futures:
                     continue
@@ -1032,11 +1047,18 @@ class DistAdam(torch.optim.Optimizer):
                 denom = exp_avg_sq.sqrt().add_(eps)
                 step_size = lr * (bias2 ** 0.5 / bias1)
                 update = exp_avg.div(denom).mul_(step_size)
-                # cautious weight decay
-                mask = (update * p_slice) > 0
-                # lr as weight decay schedule
-                eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
-                update.addcmul_(p_slice, mask, value=eff_weight_decay * lr)
+
+                if standard_adamw:
+                    # Standard AdamW: unconditional decoupled weight decay,
+                    # scaled by the effective parameter learning rate exactly once.
+                    eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
+                    update.add_(p_slice, alpha=eff_weight_decay)
+                else:
+                    # Preserve the original cautious-decay convention used by
+                    # the Muon hybrid optimizer.
+                    mask = (update * p_slice) > 0
+                    eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
+                    update.addcmul_(p_slice, mask, value=eff_weight_decay * lr)
 
                 p_slice.add_(other=update, alpha=-1.0)
 
@@ -1135,9 +1157,61 @@ class AttnArgs:
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
+# -----------------------------------------------------------------------------
+# Diagnostic: max pre-softmax attention logit (Kimi K2 style)
+#
+# Flash attention doesn't expose the (T, T) score matrix, so when this flag is
+# on we recompute  attn_scale * (q @ k.mT)  in chunks alongside flash attention.
+# Costs one extra pass through the score matrix per attention forward, so we
+# gate it behind a flag and fire only every N training steps (via the config
+# knob `attn_logit_log_every` in Hyperparameters below). When the flag is off,
+# the check is a Python `if` returning False -- zero overhead.
+#
+# Usage from the training loop:
+#   enable_attn_logit_capture()      # before the training forward
+#   loss.backward(); optimizer.step()   # normal training step
+#   max_logit = read_and_reset_attn_logit_capture()  # returns float, disables flag
+#
+# All-reduce is MAX across DP ranks, since each rank sees a different batch and
+# we want the global worst-case logit.
+
+_CAPTURE_ATTN_LOGIT: bool = False
+# Per-attention-layer max is stored on each CausalSelfAttention module as a buffer
+# (see register_buffer in __init__). This keeps the tensor on the module's device,
+# plays nicely with torch.compile (buffer mutation is standard), and avoids any
+# Python-level dynamic state that would trigger recompilations.
+
+def enable_attn_logit_capture():
+    """Turn on max-attention-logit capture for the next forward pass(es)."""
+    global _CAPTURE_ATTN_LOGIT
+    _CAPTURE_ATTN_LOGIT = True
+    # buffers get reset on read, so nothing else to do here
+
+def read_and_reset_attn_logit_capture(model: nn.Module) -> float:
+    """Read the max logit captured since enable_attn_logit_capture(),
+    all-reduce across ranks, disable capture, and return a Python float.
+    Must be called with the top-level model so we can walk its attention modules."""
+    global _CAPTURE_ATTN_LOGIT
+    _CAPTURE_ATTN_LOGIT = False
+    maxes = [mod.attn_logit_max for mod in model.modules()
+             if isinstance(mod, CausalSelfAttention)]
+    if not maxes:
+        return float('nan')
+    m = torch.stack(maxes).amax()
+    if dist.is_initialized():
+        dist.all_reduce(m, op=dist.ReduceOp.MAX)
+    # reset every layer's buffer for the next capture window
+    for mod in model.modules():
+        if isinstance(mod, CausalSelfAttention):
+            mod.attn_logit_max.fill_(float('-inf'))
+    if m.item() == float('-inf'):
+        return float('nan')
+    return m.item()
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.dim = dim
@@ -1168,6 +1242,13 @@ class CausalSelfAttention(nn.Module):
             self.value_embed_gate.weight.label = 'value_embed_gate'
             self.value_embed_gate.weight.lr_mul = 0.1
 
+        # Diagnostic buffer: max pre-softmax attention logit for this layer.
+        # persistent=False so it's not saved in checkpoints. Buffer moves with the
+        # module (e.g. via model.cuda()), so device always matches q/k at forward.
+        self.register_buffer('attn_logit_max',
+                             torch.tensor(float('-inf')),
+                             persistent=False)
+
     def forward(self, x: Tensor, attn_args: AttnArgs):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "varlen sequences requires B == 1"
@@ -1187,6 +1268,31 @@ class CausalSelfAttention(nn.Module):
         if ve is not None:
             ve_gate_out = 2 * torch.sigmoid(self.value_embed_gate(x[..., :self.value_embed_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
             v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
+
+        # Diagnostic: max pre-softmax attention logit (Kimi K2 style). Flash attention
+        # never materializes the (T,T) score matrix, so we recompute chunked here.
+        # Only runs when the module-level flag is set (see enable_attn_logit_capture),
+        # so training-hot-path cost is zero when disabled.
+        # Note: with QK-norm active (line above), q and k are unit-normalized per token,
+        # so this max stays bounded near attn_scale regardless of weight growth --
+        # comment out `q, k = norm(q), norm(k)` to observe the pathology.
+        if _CAPTURE_ATTN_LOGIT:
+            with torch.no_grad():
+                # q,k shape: (B, T, H, D). We want max over B*H*T*T of attn_scale * <q_i, k_j>.
+                # Chunked over queries to bound memory to (B, H, chunk, T) instead of (B, H, T, T).
+                q_bhtd = q.transpose(1, 2)  # (B, H, T, D)
+                k_bhtd = k.transpose(1, 2)  # (B, H, T, D)
+                chunk = 128
+                layer_max = q.new_tensor(float('-inf'))
+                for i in range(0, T, chunk):
+                    q_chunk = q_bhtd[:, :, i : i + chunk]                 # (B, H, chunk, D)
+                    logits = attn_scale * (q_chunk @ k_bhtd.mT)           # (B, H, chunk, T)
+                    layer_max = torch.maximum(layer_max, logits.amax())
+                # Running max: with grad_accum_steps > 1, the forward runs multiple
+                # times per training step. Take the max across all micro-batches so
+                # this matches the original append+amax semantics.
+                torch.maximum(self.attn_logit_max, layer_max.detach(),
+                              out=self.attn_logit_max)
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
@@ -1694,29 +1800,56 @@ class TrainingManager():
         muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
         assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + scalar_labels + muon_labels), "All params must have label"
 
-        self.adam_opt = DistAdam(adam_params, adam_labels, lr=0.004, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.005)
-        self.scalar_opt = DistAdam(scalar_params, scalar_labels, lr=0.008, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.005)
-        self.muon_opt = NorMuon(muon_params, lr=0.015, momentum=0.95, beta2=0.95, weight_decay=1.2)
-        
-        for group in muon_opt.param_groups:
-            group["orth_method"] = "softclip"
-            group["clip_D"] = 1.0
+        if args.optimizer_type == "muon":
+            # ---- Default: three-optimizer Muon hybrid (original behavior). ----
+            self.adam_opt = DistAdam(adam_params, adam_labels, lr=0.004, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.005)
+            self.scalar_opt = DistAdam(scalar_params, scalar_labels, lr=0.008, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.005)
+            self.muon_opt = NorMuon(muon_params, lr=0.015, momentum=0.95, beta2=0.95, weight_decay=1.2)
 
-        self.optimizers = [self.adam_opt, self.scalar_opt, self.muon_opt]
+            for group in self.muon_opt.param_groups:
+                group["orth_method"] = "vanilla_muon_no_triton"
+                group["clip_D"] = 1.0
+
+            self.optimizers = [self.adam_opt, self.scalar_opt, self.muon_opt]
+        else:
+            # ---- Baseline: single DistAdam over ALL params. ----
+            # "adamw" = with weight decay, "adam" = weight_decay forced to 0.
+            # Every param steps every iteration (odd_step_only disabled below).
+            # scalar_opt and muon_opt are None; None-guards below in step_optimizers,
+            # reset, start_transition preserve the rest of the training loop.
+            assert args.optimizer_type in ("adamw", "adam"), \
+                f"optimizer_type must be one of 'muon' / 'adamw' / 'adam', got {args.optimizer_type!r}"
+            wd = args.baseline_weight_decay if args.optimizer_type == "adamw" else 0.0
+            all_labels = adam_labels + scalar_labels + muon_labels
+            all_params = adam_params + scalar_params + muon_params
+            self.adam_opt = DistAdam(
+                all_params, all_labels,
+                lr=args.baseline_lr, betas=args.baseline_betas, eps=1e-8, weight_decay=wd,
+                standard_adamw=(args.optimizer_type == "adamw"),
+            )
+            self.scalar_opt = None
+            self.muon_opt = None
+            self.optimizers = [self.adam_opt]
+
         # split after odd number step
         self.split_step = math.ceil(args.split_embed_frac * args.num_scheduled_iterations) | 1
 
         # set defaults
         for opt in self.optimizers:
             opt.freeze_timer = 0
-            opt.odd_step_only = False 
-            opt.should_sync = True
+            opt.odd_step_only = False
+            # DistAdam hooks are enabled only for the final accumulation
+            # micro-batch by activate_hooks().
+            opt.should_sync = False
             for group in opt.param_groups:
                 group["initial_lr"] = group["lr"]
 
-        # on even steps, only step Muon params
-        self.adam_opt.odd_step_only = True
-        self.scalar_opt.odd_step_only = True
+        if args.optimizer_type == "muon":
+            # on even steps, only step Muon params
+            self.adam_opt.odd_step_only = True
+            self.scalar_opt.odd_step_only = True
+        # In the "adamw"/"adam" baselines we leave odd_step_only=False so the
+        # single DistAdam steps every iteration.
 
         self.reset()
 
@@ -1775,21 +1908,24 @@ class TrainingManager():
     
     def step_optimizers(self, step: int):                
         step_lr = get_lr(step)
-        muon_momentum = get_muon_momentum(step)
-        for group in self.muon_opt.param_groups:
-            group["momentum"] = muon_momentum
+        if self.muon_opt is not None:
+            muon_momentum = get_muon_momentum(step)
+            for group in self.muon_opt.param_groups:
+                group["momentum"] = muon_momentum
 
         for opt in self.optimizers:
             if opt.freeze_timer > 0:
                 opt.freeze_timer -= 1
                 opt.zero_grad(set_to_none=True)
+                if isinstance(opt, DistAdam):
+                    opt.should_sync = False
             else:
                 if self._is_active_step(opt, step):
                     for group in opt.param_groups:
                         group["lr"] = group["initial_lr"] * step_lr
                     opt.step()
                     opt.zero_grad(set_to_none=True)
-                    if opt.odd_step_only:
+                    if isinstance(opt, DistAdam):
                         opt.should_sync = False
         
         if step == self.split_step:
@@ -1798,12 +1934,15 @@ class TrainingManager():
 
     def start_transition(self, freeze_count=40):
         # freeze scalar weights during transition
-        self.scalar_opt.freeze_timer = freeze_count
+        if self.scalar_opt is not None:
+            self.scalar_opt.freeze_timer = freeze_count
     
     def activate_hooks(self, step: int):
         for opt in self.optimizers:
-            if self._is_active_step(opt, step):
-                opt.should_sync = True
+            if isinstance(opt, DistAdam):
+                opt.should_sync = (
+                    opt.freeze_timer == 0 and self._is_active_step(opt, step)
+                )
 
     def reset(self, state=None):
         if state is not None:
@@ -1812,7 +1951,8 @@ class TrainingManager():
                 opt.load_state_dict(opt_state)
 
         # muon momentum buffers not in state dict
-        self.muon_opt.reset()
+        if self.muon_opt is not None:
+            self.muon_opt.reset()
         self.model.split_embed = False
 
         self.ws_short, self.ws_long = get_ws(0)
@@ -1836,6 +1976,10 @@ class Hyperparameters:
                                 524288, 524288, 524288, 524288,
                                 524288, 524288, 524288, 524288
                                )
+
+    #train_bs_schedule = (32768, 65536, 98304, 131072, 
+    #                     131072, 131072, 131072, 131072, 
+    #                     131072, 131072, 131072, 131072)
     train_bs_extension: int = 32 * 2048 * 8
     train_max_seq_len: int = 128 * 16 * 2 # doubled to enable longer window sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
@@ -1845,9 +1989,23 @@ class Hyperparameters:
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.70  # fraction of num_scheduled_iterations spent cooling down the learning rate
     split_embed_frac: float = 2/3/4
+    # Baseline optimizer selection. "muon" runs the three-optimizer hybrid
+    # (adam_opt + scalar_opt + muon_opt) unchanged. "adamw" or "adam" collapses
+    # everything into a single DistAdam that optimizes ALL parameters -- for
+    # ablation baselines. In "adam" mode, weight_decay is forced to 0.
+    optimizer_type: str = "adamw"       # "muon" | "adamw" | "adam"
+    baseline_lr: float = 0.004         # LR for the all-Adam baselines 0.0267对应 muon步长0.1
+    baseline_weight_decay: float = 0.005    # WD for the "adamw" baseline
+    baseline_betas: tuple = (0.9, 0.95)     # betas for the all-Adam baselines
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = 50  # every how many steps to evaluate val loss? 0 for only at the end
+    # every how many steps to log max attention logit (0 = never). Adds one manual q@k
+    # pass alongside flash attention on the diagnostic step -- see notes on the
+    # helpers in this file. Note: with QK-norm active (line ~1218) the max stays near
+    # attn_scale regardless of training dynamics; comment out QK-norm to observe the
+    # Kimi K2 attention-logit-explosion pathology.
+    attn_logit_log_every: int = 0
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
@@ -1888,6 +2046,25 @@ def print0(s, console=False):
             if console:
                 print(s)
             print(s, file=f)
+
+@torch.no_grad()
+def get_attn_param_max(model: nn.Module) -> tuple[float, float]:
+    """Return the global maximum and absolute maximum of Muon's QKVO weights."""
+    attn_params = [
+        param.detach()
+        for param in model.parameters()
+        if getattr(param, "label", None) == "attn"
+    ]
+    assert attn_params, "No parameters with label='attn' were found"
+
+    # Parameters are synchronized by the distributed optimizer, but MAX reduction
+    # also makes this diagnostic correct if the optimizer implementation changes.
+    param_max = torch.stack([param.amax() for param in attn_params]).amax()
+    param_abs_max = torch.stack([param.abs().amax() for param in attn_params]).amax()
+    if dist.is_initialized():
+        dist.all_reduce(param_max, op=dist.ReduceOp.MAX)
+        dist.all_reduce(param_abs_max, op=dist.ReduceOp.MAX)
+    return param_max.item(), param_abs_max.item()
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -2005,6 +2182,16 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    # Optionally capture max attention logit on this step. Enabling here (before the
+    # forward pass) means the manual q@k pass runs alongside flash attention; reading
+    # after step_optimizers keeps the diagnostic cheap on off-steps.
+    _log_attn_logit_this_step = (
+        args.attn_logit_log_every > 0
+        and (step + 1) % args.attn_logit_log_every == 0
+    )
+    if _log_attn_logit_this_step:
+        enable_attn_logit_capture()
+
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
         if idx == grad_accum_steps - 1:
@@ -2014,9 +2201,22 @@ for step in range(train_steps + 1):
         (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
+    max_attn_logit = (
+        read_and_reset_attn_logit_capture(model) if _log_attn_logit_this_step else float('nan')
+    )
+
     # logging
+    attn_param_max, attn_param_abs_max = get_attn_param_max(model)
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(
+        f"step:{step+1}/{train_steps} "
+        f"attn_param_max:{attn_param_max:.6f} "
+        f"attn_param_abs_max:{attn_param_abs_max:.6f} "
+        f"max_attn_logit:{max_attn_logit:.4f} "
+        f"train_time:{approx_training_time_ms:.0f}ms "
+        f"step_avg:{approx_training_time_ms/(step + 1):.2f}ms",
+        console=True,
+    )
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)

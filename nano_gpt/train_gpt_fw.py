@@ -409,16 +409,27 @@ def softclip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
     is_tall = X.size(-2) > X.size(-1)
     batched = X.ndim > 2
     bmm = torch.bmm if batched else torch.mm
-    D = clip_D_t.to(X.dtype)
 
-    # Use whichever Gram matrix is smaller: G^T G (tall case) or G G^T (wide case)
+    # Pre-normalize by Frobenius norm (same convention as vanilla_muon's spectral-norm
+    # normalization): ensures singular values of X are in [0,1], so D is self-relative.
+    # The 1.02 factor matches vanilla_muon's slightly conservative scaling.
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
+    X = X.contiguous()
+
+    D = clip_D_t.item()   # scalar float, used to construct the fp32 Gram matrix below
+
+    # Form the smaller Gram matrix in fp32 (not bf16!) to avoid the precision ceiling
+    # we measured empirically in the coupled iteration. Only the small n x n matrix
+    # (n = min(rows,cols)) is promoted to fp32; the large m x n matmul for the final
+    # output stays in bf16.
+    X_f32 = X.float()
     if is_tall:
-        M = bmm(X.mT, X) if batched else X.mT @ X    # (..., n, n), n = cols (the smaller dim)
+        M = (bmm(X_f32.mT, X_f32) if batched else X_f32.mT @ X_f32)  # (..., n, n) fp32
     else:
-        M = bmm(X, X.mT) if batched else X @ X.mT    # (..., m, m), m = rows (the smaller dim)
+        M = (bmm(X_f32, X_f32.mT) if batched else X_f32 @ X_f32.mT)  # (..., m, m) fp32
 
     n = M.size(-1)
-    I = torch.eye(n, device=X.device, dtype=X.dtype).expand_as(M).clone()
+    I = torch.eye(n, device=M.device, dtype=torch.float32).expand_as(M).clone()
     M = M + (D * D) * I
     alpha = M.norm(dim=(-2, -1), keepdim=True) + 1e-6
     Y = M / alpha
@@ -428,13 +439,15 @@ def softclip_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
         T = 0.5 * (3 * I - ZY)
         Y = bmm(Y, T) if batched else Y @ T
         Z = bmm(T, Z) if batched else T @ Z
-    invsqrt = Z / alpha.sqrt()
+    invsqrt = (Z / alpha.sqrt()).to(X.dtype)   # cast back to bf16 for the big output matmul
 
+    D_t = torch.tensor(D, device=X.device, dtype=X.dtype)
     if is_tall:
-        out = D * (bmm(X, invsqrt) if batched else X @ invsqrt)
+        out = D_t * (bmm(X, invsqrt) if batched else X @ invsqrt)
     else:
-        out = D * (bmm(invsqrt, X) if batched else invsqrt @ X)
+        out = D_t * (bmm(invsqrt, X) if batched else invsqrt @ X)
     return out
+
 
 # -----------------------------------------------------------------------------
 # Frank-Wolfe spectral clip: alternative to softclip_muon's coupled-Newton-Schulz construction
