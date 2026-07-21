@@ -1187,6 +1187,11 @@ def enable_attn_logit_capture():
     _CAPTURE_ATTN_LOGIT = True
     # buffers get reset on read, so nothing else to do here
 
+def disable_attn_logit_capture():
+    """Turn off attention-logit capture without reading the buffers."""
+    global _CAPTURE_ATTN_LOGIT
+    _CAPTURE_ATTN_LOGIT = False
+
 def read_and_reset_attn_logit_capture(model: nn.Module) -> float:
     """Read the max logit captured since enable_attn_logit_capture(),
     all-reduce across ranks, disable capture, and return a Python float.
@@ -1204,9 +1209,101 @@ def read_and_reset_attn_logit_capture(model: nn.Module) -> float:
     for mod in model.modules():
         if isinstance(mod, CausalSelfAttention):
             mod.attn_logit_max.fill_(float('-inf'))
+            mod.attn_logit_max_per_head.fill_(float('-inf'))
     if m.item() == float('-inf'):
         return float('nan')
     return m.item()
+
+
+# -----------------------------------------------------------------------------
+# MuonClip / QK-Clip (Kimi K2 Algorithm 1).
+#
+# Called AFTER each optimizer step. For every attention head h in every layer:
+#     gamma_h = min(1, tau / S^h_max)
+#     if gamma_h < 1:
+#         W_q^h *= gamma_h ** alpha
+#         W_k^h *= gamma_h ** (1 - alpha)
+# with alpha = 0.5 (per paper), so both scale by sqrt(gamma_h), and the attention
+# logit -- which is a bilinear form in W_q and W_k -- scales by gamma_h itself,
+# bounding it at tau. Kimi K2 uses tau = 100.
+#
+# Per-head S^h_max is measured DURING the forward pass (see the capture branch in
+# CausalSelfAttention.forward). apply_qk_clip requires _CAPTURE_ATTN_LOGIT to have
+# been on during that forward pass.
+#
+# This codebase stores Q, K, V, O as one fused tensor `qkvo_w` of shape (4*dim, hdim)
+# per attention layer. In that fused layout:
+#   rows [0                : num_heads*head_dim)                = W_q  (grouped by head)
+#   rows [num_heads*head_dim : 2*num_heads*head_dim)            = W_k
+# so W_q for head h is qkvo_w[h*head_dim : (h+1)*head_dim] and W_k for head h is
+# qkvo_w[num_heads*head_dim + h*head_dim : num_heads*head_dim + (h+1)*head_dim].
+#
+# CAVEATS:
+#  * With QK-norm active (q, k = norm(q), norm(k) in forward), the effective attention
+#    logit is bounded near attn_scale regardless of weight growth, so S^h_max <= a
+#    small constant and this clip essentially never fires. To reproduce Kimi K2's
+#    setting you must first disable QK-norm in the attention forward.
+#  * `attn_scale` is NOT 1/sqrt(d); it's a ramped schedule. Our S^h_max uses the same
+#    scale flash attention uses, so tau is interpreted in the same units.
+#  * sa_lambdas[0] pre-multiplies the QKV projection at forward time but is not
+#    modified here. Rescaling qkvo_w by a per-head factor still yields a per-head
+#    clip on the effective post-lambda weights.
+
+@torch.no_grad()
+def apply_qk_clip(model: nn.Module, tau: float = 100.0, alpha: float = 0.5) -> float:
+    """Apply per-head QK-Clip and return the projected post-clip max logit.
+
+    The returned value is computed as max_h(S_max_h * gamma_h). It is the
+    post-scaling value implied by the captured logits and applied gamma, not a
+    second forward-pass measurement.
+
+    Args:
+        model: top-level model whose CausalSelfAttention modules we walk.
+        tau: threshold for max attention logit. Kimi K2 uses 100.
+        alpha: query/key split. Kimi K2 uses 0.5 (symmetric).
+    """
+    post_clip_max = None
+    for mod in model.modules():
+        if not isinstance(mod, CausalSelfAttention):
+            continue
+
+        s_max_h = mod.attn_logit_max_per_head          # (num_heads,), fp32
+        # All-reduce across DP ranks so every rank clips identically.
+        if dist.is_initialized():
+            dist.all_reduce(s_max_h, op=dist.ReduceOp.MAX)
+
+        gamma = torch.clamp(tau / s_max_h.clamp(min=1e-8), max=1.0)   # (num_heads,)
+        layer_post_clip_max = (s_max_h * gamma).amax()
+        post_clip_max = (
+            layer_post_clip_max
+            if post_clip_max is None
+            else torch.maximum(post_clip_max, layer_post_clip_max)
+        )
+
+        # Skip if nothing to clip on this layer (all gamma == 1).
+        if bool((gamma >= 1.0).all()):
+            continue
+
+        q_scale = gamma ** alpha                       # (num_heads,)
+        k_scale = gamma ** (1.0 - alpha)               # (num_heads,)
+
+        H, D = mod.num_heads, mod.head_dim
+        qkvo = mod.qkvo_w.data                          # (4*num_heads*head_dim, hdim)
+        q_block = qkvo[0:H*D].view(H, D, -1)
+        q_block.mul_(q_scale.view(H, 1, 1).to(q_block.dtype))
+        k_block = qkvo[H*D:2*H*D].view(H, D, -1)
+        k_block.mul_(k_scale.view(H, 1, 1).to(k_block.dtype))
+        # V and O blocks unchanged.
+
+    # Reset per-head running max on ALL attention layers so the next training step
+    # starts fresh.
+    for mod in model.modules():
+        if isinstance(mod, CausalSelfAttention):
+            mod.attn_logit_max_per_head.fill_(float('-inf'))
+
+    if post_clip_max is None or post_clip_max.item() == float('-inf'):
+        return float('nan')
+    return post_clip_max.item()
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -1248,6 +1345,12 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer('attn_logit_max',
                              torch.tensor(float('-inf')),
                              persistent=False)
+        # Per-head max, needed by MuonClip / QK-Clip. Same lifecycle as attn_logit_max
+        # (running max across grad-accum micro-batches, reset after each optimizer step
+        # by apply_qk_clip when MuonClip is on, or by read_and_reset_attn_logit_capture).
+        self.register_buffer('attn_logit_max_per_head',
+                             torch.full((num_heads,), float('-inf')),
+                             persistent=False)
 
     def forward(self, x: Tensor, attn_args: AttnArgs):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -1259,7 +1362,7 @@ class CausalSelfAttention(nn.Module):
         seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
 
         q, k, v = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        #q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
         if key_offset:
             # shift keys forward for the stationary head dims. Enables 1-layer induction.
@@ -1284,15 +1387,22 @@ class CausalSelfAttention(nn.Module):
                 k_bhtd = k.transpose(1, 2)  # (B, H, T, D)
                 chunk = 128
                 layer_max = q.new_tensor(float('-inf'))
+                # Per-head max for QK-Clip: shape (H,). Same running-max semantics.
+                per_head_max = q.new_full((self.num_heads,), float('-inf'))
                 for i in range(0, T, chunk):
                     q_chunk = q_bhtd[:, :, i : i + chunk]                 # (B, H, chunk, D)
                     logits = attn_scale * (q_chunk @ k_bhtd.mT)           # (B, H, chunk, T)
                     layer_max = torch.maximum(layer_max, logits.amax())
+                    # amax over batch, chunk-query, and key gives per-head max on this chunk.
+                    per_head_max = torch.maximum(per_head_max, logits.amax(dim=(0, 2, 3)))
                 # Running max: with grad_accum_steps > 1, the forward runs multiple
                 # times per training step. Take the max across all micro-batches so
                 # this matches the original append+amax semantics.
                 torch.maximum(self.attn_logit_max, layer_max.detach(),
                               out=self.attn_logit_max)
+                # Per-head running max, used by QK-Clip (consumed post optimizer step).
+                torch.maximum(self.attn_logit_max_per_head, per_head_max.detach(),
+                              out=self.attn_logit_max_per_head)
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
@@ -1804,7 +1914,7 @@ class TrainingManager():
             # ---- Default: three-optimizer Muon hybrid (original behavior). ----
             self.adam_opt = DistAdam(adam_params, adam_labels, lr=0.004, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.005)
             self.scalar_opt = DistAdam(scalar_params, scalar_labels, lr=0.008, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.005)
-            self.muon_opt = NorMuon(muon_params, lr=0.015, momentum=0.95, beta2=0.95, weight_decay=1.2)
+            self.muon_opt = NorMuon(muon_params, lr=0.1, momentum=0.95, beta2=0.95, weight_decay=1.2)
 
             for group in self.muon_opt.param_groups:
                 group["orth_method"] = "vanilla_muon_no_triton"
@@ -1904,6 +2014,7 @@ class TrainingManager():
             self.train_loader_send_args = None
 
         self.ws_long = new_ws_long
+        self.batch_size = new_batch_size
         self.mtp_weights = self.mtp_weights_schedule[step]
     
     def step_optimizers(self, step: int):                
@@ -1993,7 +2104,7 @@ class Hyperparameters:
     # (adam_opt + scalar_opt + muon_opt) unchanged. "adamw" or "adam" collapses
     # everything into a single DistAdam that optimizes ALL parameters -- for
     # ablation baselines. In "adam" mode, weight_decay is forced to 0.
-    optimizer_type: str = "adamw"       # "muon" | "adamw" | "adam"
+    optimizer_type: str = "muon"       # "muon" | "adamw" | "adam"
     baseline_lr: float = 0.004         # LR for the all-Adam baselines 0.0267对应 muon步长0.1
     baseline_weight_decay: float = 0.005    # WD for the "adamw" baseline
     baseline_betas: tuple = (0.9, 0.95)     # betas for the all-Adam baselines
@@ -2006,6 +2117,28 @@ class Hyperparameters:
     # attn_scale regardless of training dynamics; comment out QK-norm to observe the
     # Kimi K2 attention-logit-explosion pathology.
     attn_logit_log_every: int = 0
+    # ----- MuonClip / QK-Clip (Kimi K2 Algorithm 1) -----
+    # When True, applies interval QK-Clip: every muonclip_every training steps,
+    # capture per-head max attention logits and apply QK-Clip after that optimizer
+    # step. Intervening steps and validation do not run the manual q@k pass.
+    # NOTE: with QK-norm active this is essentially a no-op -- disable QK-norm
+    # in the attention forward to see QK-Clip actually fire.
+    use_muonclip: bool = True
+    muonclip_tau: float = 100.0
+    muonclip_alpha: float = 0.5
+    muonclip_every: int = 10
+    # Early-stopping knob for MuonClip:
+    #   0 (default): keep this interval MuonClip variant on for the entire run.
+    #   >0        : disable MuonClip after this many training steps. Motivated by
+    #               Kimi K2's Figure 2 (right) observation that max logits
+    #               "self-deactivate" after ~30% of training -- once logits drop
+    #               below tau, QK-Clip becomes a no-op but the measurement is
+    #               still expensive. Setting this to e.g. 30% * num_iterations
+    #               skips the expensive q@k measurement past that point.
+    #               Cost: if logits ever re-explode after this step, we won't
+    #               notice or clip. Only safe if you've verified in a full-run
+    #               baseline that logits stay stable past this point.
+    muonclip_end_step: int = 0
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
@@ -2145,6 +2278,22 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
+
+# Interval MuonClip: every muonclip_every training steps, capture per-head logits
+# on the training batch and apply QK-Clip after the optimizer step. Capture remains
+# off during validation and intervening training steps. muonclip_end_step can stop
+# the interval schedule early (see Hyperparameters).
+if args.use_muonclip:
+    assert args.attn_logit_log_every == 0, \
+        "Diagnostic max-logit logging (attn_logit_log_every>0) conflicts with " \
+        "use_muonclip=True (both manage _CAPTURE_ATTN_LOGIT). Set attn_logit_log_every=0."
+    assert args.muonclip_every > 0, "muonclip_every must be a positive integer"
+    assert args.muonclip_end_step >= 0, "muonclip_end_step must be non-negative"
+
+# Latch: True while MuonClip is running, False after it self-disables via
+# muonclip_end_step. Used to print the deactivation message exactly once.
+_muonclip_active = args.use_muonclip
+
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
@@ -2192,6 +2341,16 @@ for step in range(train_steps + 1):
     if _log_attn_logit_this_step:
         enable_attn_logit_capture()
 
+    # Interval MuonClip runs on printed training steps 10, 20, 30, ... by default.
+    # The flag is enabled only around this training forward, so validation never
+    # contributes to the QK-Clip statistic.
+    _do_muonclip_this_step = (
+        _muonclip_active
+        and (step + 1) % args.muonclip_every == 0
+    )
+    if _do_muonclip_this_step:
+        enable_attn_logit_capture()
+
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
         if idx == grad_accum_steps - 1:
@@ -2201,9 +2360,34 @@ for step in range(train_steps + 1):
         (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
-    max_attn_logit = (
-        read_and_reset_attn_logit_capture(model) if _log_attn_logit_this_step else float('nan')
-    )
+    # -------- Interval MuonClip: apply only on capture steps --------
+    if _do_muonclip_this_step:
+        max_attn_logit_after_clip = apply_qk_clip(
+            model, tau=args.muonclip_tau, alpha=args.muonclip_alpha
+        )
+        # Reads the scalar maximum for logging, resets both buffers, and turns
+        # capture off before the next step (and before any later validation).
+        max_attn_logit = read_and_reset_attn_logit_capture(model)
+    else:
+        max_attn_logit_after_clip = float('nan')
+        # No interval capture on this step. The optional diagnostic path is used
+        # only when MuonClip itself is disabled (enforced by the assertion above).
+        max_attn_logit = (
+            read_and_reset_attn_logit_capture(model) if _log_attn_logit_this_step else float('nan')
+        )
+
+    # Schedule-based deactivation. For example, end_step=1000 permits interval
+    # captures through step 1000, then disables all later MuonClip work.
+    if (_muonclip_active and args.muonclip_end_step > 0
+            and (step + 1) >= args.muonclip_end_step):
+        _muonclip_active = False
+        disable_attn_logit_capture()
+        print0(
+            f"[MuonClip] deactivated at step {step+1} "
+            f"(muonclip_end_step={args.muonclip_end_step}); "
+            f"skipping interval QK-Clip and q@k measurement from now on.",
+            console=True,
+        )
 
     # logging
     attn_param_max, attn_param_abs_max = get_attn_param_max(model)
@@ -2212,7 +2396,8 @@ for step in range(train_steps + 1):
         f"step:{step+1}/{train_steps} "
         f"attn_param_max:{attn_param_max:.6f} "
         f"attn_param_abs_max:{attn_param_abs_max:.6f} "
-        f"max_attn_logit:{max_attn_logit:.4f} "
+        f"max_attn_logit_before_clip:{max_attn_logit:.4f} "
+        f"max_attn_logit_after_clip:{max_attn_logit_after_clip:.4f} "
         f"train_time:{approx_training_time_ms:.0f}ms "
         f"step_avg:{approx_training_time_ms/(step + 1):.2f}ms",
         console=True,
