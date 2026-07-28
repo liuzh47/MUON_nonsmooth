@@ -2126,7 +2126,7 @@ class Hyperparameters:
     use_muonclip: bool = True
     muonclip_tau: float = 100.0
     muonclip_alpha: float = 0.5
-    muonclip_every: int = 10
+    muonclip_every: int = 30
     # Early-stopping knob for MuonClip:
     #   0 (default): keep this interval MuonClip variant on for the entire run.
     #   >0        : disable MuonClip after this many training steps. Motivated by
