@@ -517,6 +517,57 @@ def softclip_muon(G: torch.Tensor, clip_D: float, steps: int = 8, split_baddbmm:
 
 
 # -----------------------------------------------------------------------------
+# SPECTRA variant of softclip_muon: same math, but takes clip_D as a 0-D
+# torch.Tensor instead of a Python float. Kept separate from softclip_muon so
+# that anyone using orth_method="softclip" outside SPECTRA gets the original
+# (float, value-baked-into-compile) function bit-for-bit unchanged.
+#
+# The reason SPECTRA needs a tensor path: under a non-trivial S_c schedule the
+# clipping threshold c_k changes every step. Passing that as a Python float to
+# a torch.compile'd function specializes on the value at trace time and
+# retriggers compilation on every distinct value -- deadly for the recompile
+# budget. Passing a persistent 0-D CUDA tensor (updated in-place via .fill_(c_k))
+# keeps the graph identical across steps: same tensor object, same shape, same
+# dtype, only the runtime value differs.
+
+@torch.compile(dynamic=False, fullgraph=True)
+def softclip_muon_dyn(G: torch.Tensor, clip_D: torch.Tensor, steps: int = 8, split_baddbmm: bool = False):
+    """
+    Same as softclip_muon, but clip_D is a 0-D torch.Tensor (dynamic value).
+    Used by the SPECTRA path. split_baddbmm is accepted for interface
+    compatibility but unused.
+    """
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    batched = X.ndim > 2
+    bmm = torch.bmm if batched else torch.mm
+    # clip_D is already a tensor; just cast dtype to match X.
+    D = clip_D.to(dtype=X.dtype)
+
+    M = bmm(X, X.mT) if batched else X @ X.mT
+    n = M.size(-1)
+    I = torch.eye(n, device=X.device, dtype=X.dtype).expand_as(M).clone()
+    M = M + (D * D) * I
+    alpha = M.norm(dim=(-2, -1), keepdim=True) + 1e-6
+    Y = M / alpha
+    Z = I.clone()
+    for _ in range(steps):
+        ZY = bmm(Z, Y) if batched else Z @ Y
+        T = 0.5 * (3 * I - ZY)
+        Y = bmm(Y, T) if batched else Y @ T
+        Z = bmm(T, Z) if batched else T @ Z
+    invsqrt = Z / alpha.sqrt()
+
+    out = D * (bmm(invsqrt, X) if batched else invsqrt @ X)
+
+    if G.size(-2) > G.size(-1):
+        out = out.mT
+    return out
+
+
+# -----------------------------------------------------------------------------
 # Frank-Wolfe spectral clip: alternative to softclip_muon for the same goal
 # (cap singular values at D), via the variational characterization:
 #     min_{X: ||X||_2 <= D} 1/2 ||X - G||_F^2
@@ -626,6 +677,23 @@ def cautious_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
     wd_factor = wd_tensor.to(p.dtype)
     lr_factor = lr_tensor.to(p.dtype)
     p.copy_(p - (p * mask * wd_factor * lr_factor) - (v * lr_factor))
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def spectra_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
+    """
+    Strict SPECTRA eq (4) parameter update, no cautious mask:
+        p <- p - (p * wd_factor * lr_factor) - (v * lr_factor)
+             = (1 - lambda*eta_k) p  -  eta_k * v
+    The mask-free form matches eq (4)'s "(1 - lambda*eta_k) X_k" verbatim.
+    Kept separate from cautious_wd_and_update_inplace so no other orth_method
+    is affected. wd_tensor and lr_tensor are 0-D CPU tensors; under SPECTRA
+    wd_tensor omits the extra `* group["lr"]` factor (see eff_wd_all
+    computation) so wd_factor * lr_factor evaluates to lambda * eta_k.
+    """
+    wd_factor = wd_tensor.to(p.dtype)
+    lr_factor = lr_tensor.to(p.dtype)
+    p.copy_(p - (p * wd_factor * lr_factor) - (v * lr_factor))
 
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -788,9 +856,27 @@ class NorMuon(torch.optim.Optimizer):
             if "momentum_buffer" not in group:
                 group["momentum_buffer"]  = torch.zeros_like(grad_chunk[:num_params])
             momentum_buffer = group["momentum_buffer"]
-            # Apply momentum update to the persistent momentum buffer in-place
+            # Apply momentum update to the persistent momentum buffer in-place.
+            # This is paper eq (4)'s M_{k+1} = (1 - beta_k) M_k + beta_k g,
+            # with paper's beta_k <-> code's (1 - group["momentum"]).
             momentum_buffer.lerp_(grad_chunk[:num_params], 1 - group["momentum"])
-            updated_grads = grad_chunk[:num_params].lerp_(momentum_buffer, group["momentum"])
+
+            # Fetch orth_method here (earlier than the dispatch below) so we can
+            # skip the Nesterov-style lookahead computation entirely under
+            # SPECTRA -- eq (4) uses M_k directly and does not include this
+            # extra combine step, so faithfully reproducing (4) means not
+            # computing it. For every other orth_method the behavior below is
+            # bit-identical to before.
+            orth_method = group.get("orth_method", "polar_express")
+            if orth_method == "spectra":
+                # No Nesterov lookahead under SPECTRA. Alias updated_grads to
+                # the raw gradient view -- its VALUES are unused (the SPECTRA
+                # branch feeds momentum_buffer to SSC), but its SHAPE is still
+                # needed downstream for grad_shape, second_momentum_buffer
+                # allocation, and the num_params==0 fallback.
+                updated_grads = grad_chunk[:num_params]
+            else:
+                updated_grads = grad_chunk[:num_params].lerp_(momentum_buffer, group["momentum"])
 
             grad_shape = updated_grads.shape
             if params[module_idx].label == 'attn':
@@ -836,7 +922,22 @@ class NorMuon(torch.optim.Optimizer):
                 group["param_wd_cpu"] = torch.tensor(wd_mults, dtype=torch.float32, device="cpu")
 
             eff_lr_all = group["param_lr_cpu"] * group["lr"]
-            eff_wd_all = group["param_wd_cpu"] * group["weight_decay"] * group["lr"]
+            # SPECTRA (eq 4) WD term is `(1 - lambda*eta_k) X_k`, i.e. one
+            # eta_k factor. The stock cautious update computes the WD
+            # coefficient as `wd_factor * lr_factor`, so if `wd_factor` also
+            # carries an eta_k factor we end up with lambda*eta_k^2 -- an extra
+            # eta_k vs paper. To restore eq (4) exactly on the SPECTRA path
+            # WITHOUT touching cautious_wd_and_update_inplace (and therefore
+            # without changing any other orth_method's behavior), drop the
+            # `* group["lr"]` here for the "spectra" orth_method only. The
+            # `lr_factor` inside the compiled function still supplies exactly
+            # one eta_k to the WD term, matching eq (4). Every other
+            # orth_method (including the legacy "softclip") keeps the
+            # existing `lambda * eta_k^2` behavior bit-for-bit.
+            if group.get("orth_method") == "spectra":
+                eff_wd_all = group["param_wd_cpu"] * group["weight_decay"]
+            else:
+                eff_wd_all = group["param_wd_cpu"] * group["weight_decay"] * group["lr"]
 
             # Slice the portion corresponding to this rank's shard
             eff_lr_cpu = eff_lr_all[module_idx:module_idx + num_params]
@@ -846,10 +947,11 @@ class NorMuon(torch.optim.Optimizer):
             # Dispatch based on group["orth_method"] (defaults to "polar_express"):
             #   "polar_express"               -- original Polar Express (Triton kernels, optimized schedule)
             #   "vanilla_muon_no_triton"      -- fixed Muon coefficients, plain PyTorch matmuls
-            #   "softclip"                    -- soft spectral clip; requires group["clip_D"]
+            #   "softclip"                    -- soft spectral clip; requires group["clip_D"] (float)
+            #   "spectra"                     -- SPECTRA eq (4) with SSC(M_k); requires group["clip_D"] (0-D tensor)
             #   "frankwolfe"                  -- Frank-Wolfe fixed-step spectral clip; requires group["clip_D"]
             #   "frankwolfe_linesearch"       -- Frank-Wolfe exact line-search clip; requires group["clip_D"]
-            orth_method = group.get("orth_method", "polar_express")
+            # (orth_method already fetched above, before the Nesterov-lookahead gate.)
             split = (ref_param.label == 'mlp')
             if num_params == 0:
                 v_chunk = updated_grads
@@ -858,6 +960,21 @@ class NorMuon(torch.optim.Optimizer):
             elif orth_method == "softclip":
                 clip_D = group.get("clip_D", 1.0)
                 v_chunk = softclip_muon(updated_grads, clip_D=clip_D, split_baddbmm=split)
+            elif orth_method == "spectra":
+                # SPECTRA eq (4):  X_{k+1} = (1 - lambda*eta_k)X_k - alpha*eta_k * SSC(M_k)
+                # The paper applies SSC to the Polyak momentum buffer M_k directly.
+                # NorMuon/Muon's `updated_grads` is a Nesterov-style lookahead
+                # ((1-beta)*g + beta*M_k, algebraically (1-beta^2)*g + beta^2*M_{k-1}),
+                # NOT the M_k eq (4) prescribes -- so we feed `momentum_buffer` in
+                # instead. It was already EMA-updated above via lerp_ and IS paper's M_k
+                # (paper's beta_k <-> code's (1 - group["momentum"])).
+                # Reshape it the same way `updated_grads` was reshaped for 'attn' groups.
+                m_k = momentum_buffer
+                if params[module_idx].label == 'attn':
+                    m_k = m_k.view(4 * grad_shape[0], grad_shape[1] // 4, grad_shape[2])
+                clip_D = group["clip_D"]                     # 0-D CUDA tensor, updated in-place per step
+                ns_steps = group.get("spectra_ns_steps", 8)  # N_s in SPECTRA Algorithm 2
+                v_chunk = softclip_muon_dyn(m_k, clip_D=clip_D, steps=ns_steps, split_baddbmm=split)
             elif orth_method == "frankwolfe":
                 clip_D = group.get("clip_D", 1.0)
                 v_chunk = frankwolfe_clip_muon(updated_grads, clip_D=clip_D, split_baddbmm=split)
@@ -871,20 +988,49 @@ class NorMuon(torch.optim.Optimizer):
             # is 'incorrect' for O. However, correcting this showed no improvement. @chrisjmccormick
             red_dim = -1 if (is_gate or param_shape[-2] >= param_shape[-1]) else -2
 
-            v_chunk = apply_normuon_variance_reduction(
-                v_chunk, second_momentum_buffer, group["beta2"], red_dim
-            )
+            # SPECTRA eq (4) is a plain " -alpha*eta_k * SSC(M_k) " update with no
+            # extra NorMuon post-scaling. Skip variance reduction on the SPECTRA
+            # path so the update matches eq (4) exactly. All other orth_methods
+            # (including the legacy "softclip") retain variance reduction.
+            # The second_momentum_buffer is still allocated above (harmless
+            # memory cost, keeps the buffer-init branch simple) but never
+            # populated under SPECTRA.
+            if orth_method != "spectra":
+                v_chunk = apply_normuon_variance_reduction(
+                    v_chunk, second_momentum_buffer, group["beta2"], red_dim
+                )
+
+            # SPECTRA (eq 4): apply alpha to the SSC term. Scaling v_chunk here
+            # -- before cautious_wd_and_update_inplace, which multiplies by
+            # eff_lr = eta_k -- produces the "-alpha * eta_k * v_chunk" term
+            # of X_{k+1}. Gated on orth_method == "spectra" so no other
+            # orth_method is affected; the additional `spectra_alpha != 1.0`
+            # check avoids a full read/write of v_chunk when alpha is trivially 1.
+            if orth_method == "spectra":
+                spectra_alpha = group.get("spectra_alpha", 1.0)
+                if spectra_alpha != 1.0:
+                    v_chunk = v_chunk * spectra_alpha
 
             v_chunk = v_chunk.view(grad_shape)
 
-            # # "Cautious" weight decay (https://arxiv.org/abs/2510.12402)
+            # Weight-decay + parameter update. Two flavors:
+            #   - "spectra"  : strict eq (4) `(1 - lambda*eta_k) X_k - eta_k v`,
+            #                  no cautious mask (eq (4) doesn't have one).
+            #   - otherwise  : the existing cautious variant with mask-gated WD
+            #                  (https://arxiv.org/abs/2510.12402), unchanged.
+            # The dispatch is a Python-level function pick before the inner
+            # loop, so neither compiled function pays a per-iteration branch cost.
+            wd_update_fn = (
+                spectra_wd_and_update_inplace
+                if orth_method == "spectra" else cautious_wd_and_update_inplace
+            )
             updated_params = torch.empty_like(grad_chunk)
             if num_params > 0:
                 # Work on a stacked copy to avoid touching original params
                 param_chunk = torch.stack(params[module_idx:module_idx + num_params])
 
                 for local_idx in range(num_params):
-                    cautious_wd_and_update_inplace(
+                    wd_update_fn(
                         param_chunk[local_idx],
                         v_chunk[local_idx],
                         eff_wd_cpu[local_idx],
@@ -1160,12 +1306,10 @@ flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_inte
 # -----------------------------------------------------------------------------
 # Diagnostic: max pre-softmax attention logit (Kimi K2 style)
 #
-# Flash attention doesn't expose the (T, T) score matrix, so when this flag is
-# on we recompute  attn_scale * (q @ k.mT)  in chunks alongside flash attention.
-# Costs one extra pass through the score matrix per attention forward, so we
-# gate it behind a flag and fire only every N training steps (via the config
-# knob `attn_logit_log_every` in Hyperparameters below). When the flag is off,
-# the check is a Python `if` returning False -- zero overhead.
+# Flash attention doesn't expose the score maximum, so when this flag is on we
+# recompute attn_scale * (q @ k.mT) only for valid same-document causal-window
+# pairs. The windowed recomputation is gated to selected training steps; when the
+# flag is off, the check is a Python `if` returning False -- zero overhead.
 #
 # Usage from the training loop:
 #   enable_attn_logit_capture()      # before the training forward
@@ -1213,6 +1357,95 @@ def read_and_reset_attn_logit_capture(model: nn.Module) -> float:
     if m.item() == float('-inf'):
         return float('nan')
     return m.item()
+
+
+@torch.library.custom_op("nanogpt::windowed_attn_logit_max", mutates_args=())
+def windowed_attn_logit_max_op(
+    q: Tensor,
+    k: Tensor,
+    seqlens: Tensor,
+    previous_layer_max: Tensor,
+    previous_per_head_max: Tensor,
+    attn_scale: float,
+    window_size: int,
+    query_chunk_size: int,
+) -> tuple[Tensor, Tensor]:
+    """Return running max logits for the attention pairs FlashAttention can use.
+
+    This custom op is intentionally opaque to torch.compile. Its eager CUDA body
+    avoids Dynamo/Inductor unrolling the Python query-chunk loop into a gigantic
+    graph. Unlike the old dense T-by-T diagnostic, it only evaluates keys in the
+    causal left window and masks pairs that cross a varlen document boundary.
+    """
+    with torch.no_grad():
+        assert q.ndim == k.ndim == 4 and q.size(0) == k.size(0) == 1
+        assert q.shape == k.shape
+        assert query_chunk_size > 0 and window_size >= 0
+
+        _, num_tokens, num_heads, _ = q.shape
+        q_htd = q[0].transpose(0, 1)  # (H, T, D)
+        k_htd = k[0].transpose(0, 1)  # (H, T, D)
+
+        # seqlens is [0, end_doc_0, end_doc_1, ..., T, T, ...]. Duplicate T
+        # padding is harmless because token positions are always strictly below T.
+        token_positions = torch.arange(
+            num_tokens, device=q.device, dtype=seqlens.dtype
+        )
+        document_ids = torch.searchsorted(
+            seqlens[1:].contiguous(), token_positions, right=True
+        )
+
+        layer_max = previous_layer_max.clone()
+        per_head_max = previous_per_head_max.clone()
+
+        for query_start in range(0, num_tokens, query_chunk_size):
+            query_end = min(query_start + query_chunk_size, num_tokens)
+            # For all queries in this chunk, this is the smallest possible left
+            # edge and the largest causal key edge. The boolean mask below removes
+            # the extra positions introduced by grouping queries into a chunk.
+            key_start = max(0, query_start - window_size)
+            key_end = query_end
+
+            q_chunk = q_htd[:, query_start:query_end]       # (H, Q, D)
+            k_chunk = k_htd[:, key_start:key_end]           # (H, K, D)
+            logits = attn_scale * (q_chunk @ k_chunk.mT)    # (H, Q, K)
+
+            query_positions = token_positions[query_start:query_end, None]
+            key_positions = token_positions[None, key_start:key_end]
+            same_document = (
+                document_ids[query_start:query_end, None]
+                == document_ids[None, key_start:key_end]
+            )
+            valid_pair = (
+                same_document
+                & (key_positions <= query_positions)
+                & (key_positions >= query_positions - window_size)
+            )
+            logits.masked_fill_(~valid_pair.unsqueeze(0), float('-inf'))
+
+            chunk_per_head_max = logits.amax(dim=(1, 2)).float()
+            per_head_max = torch.maximum(per_head_max, chunk_per_head_max)
+            layer_max = torch.maximum(layer_max, chunk_per_head_max.amax())
+
+        return layer_max, per_head_max
+
+
+@windowed_attn_logit_max_op.register_fake
+def _(
+    q: Tensor,
+    k: Tensor,
+    seqlens: Tensor,
+    previous_layer_max: Tensor,
+    previous_per_head_max: Tensor,
+    attn_scale: float,
+    window_size: int,
+    query_chunk_size: int,
+):
+    assert q.shape == k.shape
+    assert q.ndim == 4 and q.size(0) == 1
+    assert previous_layer_max.ndim == 0
+    assert previous_per_head_max.shape == (q.size(2),)
+    return previous_layer_max.clone(), previous_per_head_max.clone()
 
 
 # -----------------------------------------------------------------------------
@@ -1372,37 +1605,28 @@ class CausalSelfAttention(nn.Module):
             ve_gate_out = 2 * torch.sigmoid(self.value_embed_gate(x[..., :self.value_embed_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
             v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
 
-        # Diagnostic: max pre-softmax attention logit (Kimi K2 style). Flash attention
-        # never materializes the (T,T) score matrix, so we recompute chunked here.
-        # Only runs when the module-level flag is set (see enable_attn_logit_capture),
-        # so training-hot-path cost is zero when disabled.
+        # Max pre-softmax attention logit (Kimi K2 style). FlashAttention does not
+        # expose this statistic, so capture steps call an opaque custom op that only
+        # recomputes valid same-document, causal, sliding-window pairs. Keeping the
+        # query loop inside the custom op prevents torch.compile(fullgraph=True) from
+        # unrolling hundreds of chunks into a huge Inductor graph.
         # Note: with QK-norm active (line above), q and k are unit-normalized per token,
         # so this max stays bounded near attn_scale regardless of weight growth --
         # comment out `q, k = norm(q), norm(k)` to observe the pathology.
         if _CAPTURE_ATTN_LOGIT:
             with torch.no_grad():
-                # q,k shape: (B, T, H, D). We want max over B*H*T*T of attn_scale * <q_i, k_j>.
-                # Chunked over queries to bound memory to (B, H, chunk, T) instead of (B, H, T, T).
-                q_bhtd = q.transpose(1, 2)  # (B, H, T, D)
-                k_bhtd = k.transpose(1, 2)  # (B, H, T, D)
-                chunk = 128
-                layer_max = q.new_tensor(float('-inf'))
-                # Per-head max for QK-Clip: shape (H,). Same running-max semantics.
-                per_head_max = q.new_full((self.num_heads,), float('-inf'))
-                for i in range(0, T, chunk):
-                    q_chunk = q_bhtd[:, :, i : i + chunk]                 # (B, H, chunk, D)
-                    logits = attn_scale * (q_chunk @ k_bhtd.mT)           # (B, H, chunk, T)
-                    layer_max = torch.maximum(layer_max, logits.amax())
-                    # amax over batch, chunk-query, and key gives per-head max on this chunk.
-                    per_head_max = torch.maximum(per_head_max, logits.amax(dim=(0, 2, 3)))
-                # Running max: with grad_accum_steps > 1, the forward runs multiple
-                # times per training step. Take the max across all micro-batches so
-                # this matches the original append+amax semantics.
-                torch.maximum(self.attn_logit_max, layer_max.detach(),
-                              out=self.attn_logit_max)
-                # Per-head running max, used by QK-Clip (consumed post optimizer step).
-                torch.maximum(self.attn_logit_max_per_head, per_head_max.detach(),
-                              out=self.attn_logit_max_per_head)
+                layer_max, per_head_max = torch.ops.nanogpt.windowed_attn_logit_max(
+                    q.detach(),
+                    k.detach(),
+                    seqlens,
+                    self.attn_logit_max,
+                    self.attn_logit_max_per_head,
+                    attn_scale,
+                    bm_size,
+                    args.attn_logit_query_chunk_size,
+                )
+                self.attn_logit_max.copy_(layer_max)
+                self.attn_logit_max_per_head.copy_(per_head_max)
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
@@ -1877,6 +2101,25 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
         momentum = momentum_max
     return momentum
 
+# SPECTRA clipping schedule S_c(c, k) from Algorithm 2 of "Enhancing LLM Training
+# via Spectral Clipping". Returns the per-step clipping threshold c_k passed to
+# SSC_{c_k}(U_k, N_s). Defaults to a constant schedule (c_k = c) when
+# spectra_clip_warmup_steps == 0, which is the trivial S_c and reproduces the
+# original constant-clip_D behavior. When spectra_clip_warmup_steps > 0, does a
+# linear warmup from spectra_clip_start to spectra_c over that many steps -- this
+# is a mild curriculum that starts with a tighter clip and relaxes it, useful
+# when the pre-optimizer update U_k has large early-training singular values.
+def get_spectra_clip_D(step: int,
+                       spectra_c: float,
+                       spectra_clip_start: float,
+                       spectra_clip_warmup_steps: int = 0):
+    if spectra_clip_warmup_steps <= 0:
+        return spectra_c
+    if step >= spectra_clip_warmup_steps:
+        return spectra_c
+    frac = step / spectra_clip_warmup_steps
+    return spectra_clip_start + frac * (spectra_c - spectra_clip_start)
+
 class TrainingManager():
     """
     Manages three optimizers for Adam embed/lm_head, Adam scalars, and Muon weight matrices.
@@ -1917,8 +2160,30 @@ class TrainingManager():
             self.muon_opt = NorMuon(muon_params, lr=0.1, momentum=0.95, beta2=0.95, weight_decay=1.2)
 
             for group in self.muon_opt.param_groups:
-                group["orth_method"] = "vanilla_muon_no_triton"
-                group["clip_D"] = 1.0
+                if args.use_spectra:
+                    # SPECTRA: use the dedicated "spectra" orth_method (see
+                    # NorMuon.step for its eq (4) update). c_k is stored as a
+                    # persistent 0-D CUDA tensor and refreshed in
+                    # step_optimizers via .fill_() to avoid torch.compile
+                    # recompilation on value change. alpha and N_s are stored
+                    # per-group and consumed inside NorMuon.step.
+                    group["orth_method"] = "spectra"
+                    initial_clip = get_spectra_clip_D(
+                        0,
+                        spectra_c=args.spectra_c,
+                        spectra_clip_start=args.spectra_clip_start,
+                        spectra_clip_warmup_steps=args.spectra_clip_warmup_steps,
+                    )
+                    group["clip_D"] = torch.tensor(
+                        initial_clip, device=device, dtype=torch.bfloat16,
+                    )
+                    group["spectra_alpha"] = args.spectra_alpha
+                    group["spectra_ns_steps"] = args.spectra_ns_steps
+                else:
+                    group["orth_method"] = "vanilla_muon_no_triton"
+                    group["clip_D"] = 1.0
+                    group["spectra_alpha"] = 1.0
+                    group["spectra_ns_steps"] = 8
 
             self.optimizers = [self.adam_opt, self.scalar_opt, self.muon_opt]
         else:
@@ -2021,8 +2286,23 @@ class TrainingManager():
         step_lr = get_lr(step)
         if self.muon_opt is not None:
             muon_momentum = get_muon_momentum(step)
+            # SPECTRA c_k = S_c(c, k). When use_spectra=False this is a no-op
+            # (clip_D stays fixed at the value set in __init__).
+            spectra_clip_D = (
+                get_spectra_clip_D(
+                    step,
+                    spectra_c=args.spectra_c,
+                    spectra_clip_start=args.spectra_clip_start,
+                    spectra_clip_warmup_steps=args.spectra_clip_warmup_steps,
+                )
+                if args.use_spectra else None
+            )
             for group in self.muon_opt.param_groups:
                 group["momentum"] = muon_momentum
+                if spectra_clip_D is not None:
+                    # In-place fill on the persistent 0-D tensor. Same tensor
+                    # object across steps -> no torch.compile recompilation.
+                    group["clip_D"].fill_(spectra_clip_D)
 
         for opt in self.optimizers:
             if opt.freeze_timer > 0:
@@ -2117,6 +2397,48 @@ class Hyperparameters:
     # attn_scale regardless of training dynamics; comment out QK-norm to observe the
     # Kimi K2 attention-logit-explosion pathology.
     attn_logit_log_every: int = 0
+    # Query rows processed by one windowed max-logit matmul. Larger values launch
+    # fewer kernels but use more temporary memory; 512 is modest on an H800.
+    attn_logit_query_chunk_size: int = 512
+    # ----- SPECTRA (Polyak-momentum instantiation, eq (4) of "Enhancing LLM
+    # Training via Spectral Clipping") -----
+    # When True, the NorMuon (Muon-family) optimizer runs the SPECTRA update
+    # in the exact form eq (4) prescribes:
+    #     X_{k+1} = (1 - lambda*eta_k) X_k  -  alpha * eta_k * clip^sp_{c_k}(M_k)
+    #     M_{k+1} = (1 - beta_k) M_k  +  beta_k * g(X_{k+1})
+    # where:
+    #   - M_k is the Polyak EMA momentum buffer (code's momentum_buffer AFTER
+    #     the in-place lerp_; paper's beta_k <-> code's 1 - group["momentum"]),
+    #   - clip^sp_{c_k}(., N_s) is the soft-spectral-clip via `softclip_muon`,
+    #   - c_k is produced by S_c (see get_spectra_clip_D),
+    #   - eta_k comes from the existing LR schedule (get_lr),
+    #   - lambda is the group weight_decay,
+    #   - alpha is spectra_alpha below.
+    # Pre-SPC (the optional raw-gradient pre-clip) is intentionally omitted.
+    #
+    # Deviations from stock NorMuon that this path introduces to match eq (4):
+    #   * SSC is applied to `momentum_buffer` (M_k) directly, NOT to the
+    #     Nesterov-style lookahead `updated_grads` that NorMuon otherwise uses.
+    #     The Nesterov lookahead lerp is also SKIPPED under SPECTRA (not just
+    #     unused) -- eq (4) is a pure Polyak momentum update, no lookahead.
+    #   * NorMuon's variance-reduction post-scaling is skipped -- eq (4) has
+    #     no such factor. It's a bare "-alpha*eta_k*SSC(M_k)" on the SSC term.
+    #   * WD-term eta_k factor: `eff_wd_all` for spectra groups omits the
+    #     extra `* group["lr"]`, so the coefficient
+    #     `wd_factor * lr_factor` inside the WD update becomes
+    #     `param_wd_cpu * param_lr_cpu * lambda * eta_k` (one eta_k, matching
+    #     eq (4)) instead of `... * lambda * eta_k^2`.
+    #   * Cautious mask on the WD term is DROPPED. Eq (4)'s
+    #     "(1 - lambda*eta_k) X_k" is a plain multiply, not a mask-gated one.
+    #     A dedicated `spectra_wd_and_update_inplace` is used for the SPECTRA
+    #     path; every other orth_method still hits the original mask-gated
+    #     `cautious_wd_and_update_inplace` bit-for-bit.
+    use_spectra: bool = False
+    spectra_c: float = 1.0                # base clip threshold c (used by S_c)
+    spectra_alpha: float = 1.0            # alpha coefficient in the SSC update
+    spectra_ns_steps: int = 8             # N_s: Newton-Schulz steps in SSC
+    spectra_clip_warmup_steps: int = 0    # >0 enables linear warmup of c_k
+    spectra_clip_start: float = 1.0       # c_k at step 0 during warmup
     # ----- MuonClip / QK-Clip (Kimi K2 Algorithm 1) -----
     # When True, applies interval QK-Clip: every muonclip_every training steps,
     # capture per-head max attention logits and apply QK-Clip after that optimizer
@@ -2289,6 +2611,8 @@ if args.use_muonclip:
         "use_muonclip=True (both manage _CAPTURE_ATTN_LOGIT). Set attn_logit_log_every=0."
     assert args.muonclip_every > 0, "muonclip_every must be a positive integer"
     assert args.muonclip_end_step >= 0, "muonclip_end_step must be non-negative"
+    assert args.attn_logit_query_chunk_size > 0, \
+        "attn_logit_query_chunk_size must be a positive integer"
 
 # Latch: True while MuonClip is running, False after it self-disables via
 # muonclip_end_step. Used to print the deactivation message exactly once.
@@ -2341,7 +2665,8 @@ for step in range(train_steps + 1):
     if _log_attn_logit_this_step:
         enable_attn_logit_capture()
 
-    # Interval MuonClip runs on printed training steps 10, 20, 30, ... by default.
+    # Interval MuonClip runs whenever the printed training step is divisible by
+    # args.muonclip_every.
     # The flag is enabled only around this training forward, so validation never
     # contributes to the QK-Clip statistic.
     _do_muonclip_this_step = (
