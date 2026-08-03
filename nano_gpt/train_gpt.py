@@ -2479,9 +2479,32 @@ class Hyperparameters:
     #   "adamw" -- banks trained with standard decoupled-weight-decay AdamW
     #              (Loshchilov & Hutter 2019, betas=(0.9, 0.95), lr_mul=0.1,
     #              wd_mul=1.0). Small-Adam params update every step.
-    # Set via env var MODE=<adam|adamw|muon>. Defaults to "muon".
+    #   "softclip_muonclip" -- banks trained with NorMuon using orth_method="softclip"
+    #              (soft spectral cap via coupled Newton-Schulz on the fp32 Gram
+    #              matrix; each singular value soft-capped at softclip_clip_D
+    #              instead of orthogonalized) AND MuonClip (Kimi K2 Algorithm 1)
+    #              enabled on qk_bank. Combines Muon's spectral update stability
+    #              with per-head attention-logit bounding. Auto-sets
+    #              use_muonclip=True. All-1D params (scalars, embeds, lm_head,
+    #              MUDD, gates) still use compiled cautious Adam, same as "muon".
+    #   "spectra_muonclip" -- banks trained with NorMuon using orth_method="spectra"
+    #              (SPECTRA eq 4: SSC(M_k) applied to the Polyak momentum M_k
+    #              directly with clip threshold spectra_c) AND MuonClip enabled
+    #              on qk_bank. Combines SPECTRA's spectral clipping of the raw
+    #              momentum with per-head attention-logit bounding. Auto-sets
+    #              use_muonclip=True. All-1D params still use compiled cautious
+    #              Adam, same as "muon".
+    # Set via env var MODE=<adam|adamw|muon|softclip_muonclip|spectra_muonclip>.
+    # Defaults to "muon".
     # -------------------------------------------------------------------------
     mode: str = os.environ.get("MODE", "muon")
+    # Base clip thresholds for the combined Muon-family modes above:
+    #   softclip_clip_D -- clip_D passed to softclip_muon when MODE=softclip_muonclip.
+    #   spectra_c       -- constant c_k passed to SSC when MODE=spectra_muonclip
+    #                      (this file has no S_c warmup schedule -- c_k is constant).
+    # Ignored by every other mode.
+    softclip_clip_D: float = 1.0
+    spectra_c: float = 1.0
     # -------------------------------------------------------------------------
     # MuonClip / QK-Clip (Kimi K2 Algorithm 1).
     # When use_muonclip=True, every `muonclip_every` training steps we turn on
@@ -2510,9 +2533,15 @@ class Hyperparameters:
     attn_logit_query_chunk_size: int = 512
 
 args = Hyperparameters()
-assert args.mode in ("adam", "adamw", "muon"), (
-    f"Invalid MODE={args.mode!r}; must be one of 'adam', 'adamw', 'muon'"
+_VALID_MODES = ("adam", "adamw", "muon", "softclip_muonclip", "spectra_muonclip")
+assert args.mode in _VALID_MODES, (
+    f"Invalid MODE={args.mode!r}; must be one of {_VALID_MODES}"
 )
+# Combined Muon-family modes automatically enable MuonClip -- the mode name is
+# the contract. Set BEFORE the use_muonclip assertion below so the invariants
+# (muonclip_every > 0, etc.) still get checked once for the combined modes.
+if args.mode in ("softclip_muonclip", "spectra_muonclip"):
+    args.use_muonclip = True
 if args.use_muonclip:
     assert args.muonclip_every > 0, "muonclip_every must be a positive integer"
     assert args.muonclip_end_step >= 0, "muonclip_end_step must be non-negative"
@@ -2633,14 +2662,52 @@ class TrainingManager():
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         #
         # qk/vo/mlp bank configuration is mode-dependent (set via env var MODE):
-        #   "muon"  -> NorMuon banks (default orth_method vanilla_muon_no_triton)
-        #   "adam"  -> compiled cautious-Adam banks (betas=(0.9, 0.99))
-        #   "adamw" -> standard AdamW banks (betas=(0.9, 0.95), lr_mul=0.1, wd_mul=1.0)
+        #   "muon"              -> NorMuon banks, default orth_method (vanilla_muon_no_triton),
+        #                          MuonClip OFF unless USE_MUONCLIP=1 is set explicitly.
+        #   "adam"              -> compiled cautious-Adam banks (betas=(0.9, 0.99))
+        #   "adamw"             -> standard AdamW banks (betas=(0.9, 0.95), lr_mul=0.1, wd_mul=1.0)
+        #   "softclip_muonclip" -> NorMuon banks with orth_method="softclip"; MuonClip auto-ON.
+        #   "spectra_muonclip"  -> NorMuon banks with orth_method="spectra";  MuonClip auto-ON.
+        # For the softclip/spectra modes we set the per-bank orth_method + clip_D directly in
+        # the bank entry, which _build_param_config picks up (see the `table_entry.get(...)`
+        # branches around the ParamConfig construction). Other Muon variants stay selectable
+        # per-bank the same way if you want to mix (e.g. softclip on qk, polar_express on mlp).
         if args.mode == "muon":
             bank_entries = {
                 "qk_bank":  {"optim": "normuon", "comms": "sharded", "adam_betas": None},
                 "vo_bank":  {"optim": "normuon", "comms": "sharded", "adam_betas": None},
                 "mlp_bank": {"optim": "normuon", "comms": "sharded", "adam_betas": None},
+            }
+        elif args.mode == "softclip_muonclip":
+            # NorMuon banks with soft spectral cap on the Nesterov-combined update.
+            # softclip_muon caps singular values at clip_D via coupled Newton-Schulz
+            # on the fp32 Gram matrix; clip_D is baked into the compile of
+            # softclip_muon (Python float), so all three banks sharing the same
+            # value keeps the compile cache small.
+            _sc_entry = lambda: {
+                "optim": "normuon", "comms": "sharded", "adam_betas": None,
+                "orth_method": "softclip", "clip_D": args.softclip_clip_D,
+            }
+            bank_entries = {
+                "qk_bank":  _sc_entry(),
+                "vo_bank":  _sc_entry(),
+                "mlp_bank": _sc_entry(),
+            }
+        elif args.mode == "spectra_muonclip":
+            # NorMuon banks with SPECTRA eq (4): SSC(M_k) applied to the Polyak
+            # momentum M_k directly (spectra_muon), no Nesterov combine on the
+            # SSC input. clip_D is fixed to spectra_c here (constant c_k -- this
+            # file has no S_c warmup); spectra_alpha and spectra_ns_steps come
+            # from ParamConfig defaults (1.0 and 8, matching the medium file's
+            # spectra_alpha default).
+            _sp_entry = lambda: {
+                "optim": "normuon", "comms": "sharded", "adam_betas": None,
+                "orth_method": "spectra", "clip_D": args.spectra_c,
+            }
+            bank_entries = {
+                "qk_bank":  _sp_entry(),
+                "vo_bank":  _sp_entry(),
+                "mlp_bank": _sp_entry(),
             }
         elif args.mode == "adam":
             bank_entries = {
@@ -2738,11 +2805,13 @@ class TrainingManager():
         carry most of the Adam workload and must update every step, so this returns True
         unconditionally.
 
-        When the banks are NorMuon (mode "muon"), the remaining Adam params are just small
-        scalars/gates whose gradients are noisy enough that skipping even steps is fine
-        and saves communication + kernel time -- the @classiclarryd trick.
+        When the banks are NorMuon ("muon", "softclip_muonclip", "spectra_muonclip"), the
+        remaining Adam params are just small scalars/gates whose gradients are noisy
+        enough that skipping even steps is fine and saves communication + kernel time
+        -- the @classiclarryd trick.
         """
-        return step % 2 == 1 if args.mode == "muon" else True
+        _muon_family_modes = ("muon", "softclip_muonclip", "spectra_muonclip")
+        return step % 2 == 1 if args.mode in _muon_family_modes else True
 
     def get_transition_steps(self):
         return [start for start, _ in training_schedule.boundaries[1:]]
