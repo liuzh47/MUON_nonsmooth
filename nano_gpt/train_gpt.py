@@ -582,6 +582,120 @@ def spectra_muon(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, moment
 #    modified here. Rescaling qk_bank by a per-head factor still yields a per-head
 #    clip on the effective post-lambda weights.
 
+# -----------------------------------------------------------------------------
+# Windowed max-attention-logit capture (Kimi K2 style, sliding-window version)
+#
+# Ported from train_gpt_medium_spectra.py. This is a registered custom op so
+# that torch.compile treats the body as opaque -- neither the Python query-chunk
+# loop nor the per-chunk masked matmuls get unrolled/fused into the compiled
+# CausalSelfAttention.forward. That matters here for two reasons:
+#
+#  (1) The previous inline implementation computed  attn_scale * (q_chunk @ k.mT)
+#      against the *full* k tensor and then masked out out-of-window and
+#      cross-document keys. flash_attn is called with window_size=(bm_size, 0),
+#      so any key at distance > bm_size never enters the real softmax; including
+#      it in the "max pre-softmax logit" statistic is both wasted O(T^2) work
+#      and (in principle) wrong -- QK-Clip would fire on logits the model never
+#      actually computes.
+#
+#  (2) The inline version lived inside torch.compile(fullgraph=False)'s compiled
+#      forward, which is the wrong shape for a rarely-taken diagnostic branch:
+#      Inductor has to trace the masked_fill / searchsorted / running-max path
+#      even on steps when _CAPTURE_ATTN_LOGIT is False, and toggling the Python
+#      bool every muonclip_every steps risks recompiles.
+#
+# The op restricts the key range to [max(0, q_start - window_size), q_end),
+# i.e. the causal left window that flash_attn actually softmaxes over. Work per
+# layer is O(T * window_size * H * D) instead of O(T^2 * H * D), and peak memory
+# for the per-chunk logits tensor drops correspondingly.
+#
+# Layout note: caller is responsible for handling paired-head merging outside
+# the op. The op takes whatever (B, T_eff, H_eff, D) layout it's given and
+# returns per-head max over H_eff heads. See CausalSelfAttention.forward for
+# how the paired case broadcasts the (H/2,) result into an (H,) buffer.
+
+@torch.library.custom_op("train_gpt::windowed_attn_logit_max", mutates_args=())
+def _windowed_attn_logit_max_op(
+    q: Tensor,
+    k: Tensor,
+    seqlens: Tensor,
+    previous_per_head_max: Tensor,
+    attn_scale: float,
+    window_size: int,
+    query_chunk_size: int,
+) -> Tensor:
+    """Running per-head max of attn_scale * (q @ k.mT) over pairs FlashAttention
+    would actually softmax: same packed sequence, causal, inside sliding window.
+
+    Opaque to torch.compile. Returns a fp32 (H_eff,) tensor; caller copies it
+    into the attn_logit_max_per_head buffer slice.
+    """
+    with torch.no_grad():
+        assert q.ndim == k.ndim == 4 and q.size(0) == k.size(0) == 1
+        assert q.shape == k.shape
+        assert query_chunk_size > 0 and window_size >= 0
+
+        _, num_tokens, num_heads, _ = q.shape
+        q_htd = q[0].transpose(0, 1)  # (H, T, D)
+        k_htd = k[0].transpose(0, 1)  # (H, T, D)
+
+        # seqlens is [0, end_doc_0, end_doc_1, ..., T, T, ...] (see data loader).
+        # Duplicate T padding in the tail is harmless: token positions are
+        # always strictly below T, so searchsorted assigns them to a single
+        # tail-region document id -- the same behavior flash_attn uses.
+        token_positions = torch.arange(
+            num_tokens, device=q.device, dtype=seqlens.dtype
+        )
+        document_ids = torch.searchsorted(
+            seqlens[1:].contiguous(), token_positions, right=True
+        )
+
+        per_head_max = previous_per_head_max.clone()
+
+        for query_start in range(0, num_tokens, query_chunk_size):
+            query_end = min(query_start + query_chunk_size, num_tokens)
+            # Smallest possible left edge and largest causal key edge for this
+            # chunk. The valid mask below prunes the extra positions introduced
+            # by grouping queries into a chunk.
+            key_start = max(0, query_start - window_size)
+            key_end = query_end
+
+            q_chunk = q_htd[:, query_start:query_end]       # (H, Q, D)
+            k_chunk = k_htd[:, key_start:key_end]           # (H, K, D)
+            logits = attn_scale * (q_chunk @ k_chunk.mT)    # (H, Q, K)
+
+            query_positions = token_positions[query_start:query_end, None]
+            key_positions = token_positions[None, key_start:key_end]
+            same_document = (
+                document_ids[query_start:query_end, None]
+                == document_ids[None, key_start:key_end]
+            )
+            valid_pair = (
+                same_document
+                & (key_positions <= query_positions)
+                & (key_positions >= query_positions - window_size)
+            )
+            logits.masked_fill_(~valid_pair.unsqueeze(0), float("-inf"))
+
+            chunk_per_head_max = logits.amax(dim=(1, 2)).float()
+            per_head_max = torch.maximum(per_head_max, chunk_per_head_max)
+
+        return per_head_max
+
+
+@_windowed_attn_logit_max_op.register_fake
+def _(
+    q: Tensor,
+    k: Tensor,
+    seqlens: Tensor,
+    previous_per_head_max: Tensor,
+    attn_scale: float,
+    window_size: int,
+    query_chunk_size: int,
+):
+    return torch.empty_like(previous_per_head_max)
+
+
 _CAPTURE_ATTN_LOGIT: bool = False
 
 def enable_attn_logit_capture():
@@ -805,7 +919,7 @@ class ParamConfig:
     #     reduction, and uses a strict (1 - lambda*eta_k) X_k - alpha*eta_k * SSC(M_k)
     #     parameter update (no cautious mask). Requires clip_D; honors spectra_alpha
     #     and spectra_ns_steps below.
-    orth_method: str = "vanilla_muon_no_triton"
+    orth_method: str = "spectra"
     # Adam step implementation selector:
     #   "compiled" (default) -- cautious weight decay + torch.compile.
     #   "adamw"              -- standard unconditional decoupled weight decay
@@ -1372,15 +1486,7 @@ class NorMuonAndAdam:
 
         self._momentum_t.fill_(p_cfg.momentum)
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
-        # SPECTRA (eq 4) WD term is `(1 - lambda*eta_k) X_k`, i.e. exactly ONE eta_k
-        # factor. The stock cautious path computes wd_factor = wd_mul*weight_decay*lr
-        # and multiplies by lr_factor = eta_k inside the compiled kernel, giving
-        # lambda*eta_k^2 -- an extra eta_k vs paper. On the SPECTRA path only, drop
-        # the trailing `* p_cfg.lr` here so wd_factor*lr_factor evaluates to
-        # lambda*eta_k, matching eq (4). Every other orth_method (including "softclip")
-        # keeps the existing lambda*eta_k^2 semantics bit-for-bit.
-        _wd_scale = 1.0 if p_cfg.orth_method == "spectra" else p_cfg.lr
-        self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * _wd_scale)
+        self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
         # Fused Nesterov momentum + orthogonalization (or soft-clip) step.
         # Five orth methods are supported:
@@ -1412,14 +1518,16 @@ class NorMuonAndAdam:
                 split_baddbmm=is_large_matrix,
             )
         elif p_cfg.orth_method == "spectra":
-            # SPECTRA eq (4):  X_{k+1} = (1 - lambda*eta_k) X_k - alpha*eta_k * SSC(M_k)
-            # spectra_muon does the EMA update on momentum_buffer and applies SSC
-            # to the resulting Polyak buffer directly (no Nesterov combine).
+            # SPECTRA is now identical to "softclip" except for the SSC input:
+            # spectra_muon feeds the Polyak momentum M_k directly to SSC,
+            # whereas softclip_muon feeds the Nesterov combine (1-b)g + b*M_k.
+            # Everything else (steps=8 default, downstream variance reduction,
+            # WD convention, cautious weight update) matches "softclip".
             assert p_cfg.clip_D is not None, "orth_method='spectra' requires p_cfg.clip_D to be set"
             self._clip_D_t.fill_(p_cfg.clip_D)
             v_chunk = spectra_muon(
                 grad_chunk, p_state["momentum_buffer"], self._momentum_t, self._clip_D_t,
-                steps=p_cfg.spectra_ns_steps, split_baddbmm=is_large_matrix,
+                split_baddbmm=is_large_matrix,
             )
         elif p_cfg.orth_method == "polar_express":
             v_chunk = polar_express(
@@ -1429,35 +1537,21 @@ class NorMuonAndAdam:
         else:
             raise ValueError(f"Unknown orth_method: {p_cfg.orth_method!r}")
 
-        # Variance reduction -- SPECTRA (eq 4) has no such post-scaling term, so skip
-        # it on that path. Every other orth_method keeps the existing NorMuon behavior
-        # bit-for-bit. On SPECTRA, apply the eq-(4) `alpha` prefactor to the SSC term
-        # here instead (v_chunk gets multiplied by eta_k = lr_factor in the WD update
-        # below, so scaling v_chunk by alpha here yields the "-alpha*eta_k*SSC(M_k)"
-        # term). Gated on `spectra_alpha != 1.0` to avoid a full read/write when the
-        # scaling is trivially the identity.
-        if p_cfg.orth_method != "spectra":
-            red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
-            v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
-                v_chunk, p_state["second_momentum_buffer"], p_cfg.beta2, red_dim
-            )
-        elif p_cfg.spectra_alpha != 1.0:
-            v_chunk = v_chunk * p_cfg.spectra_alpha
-
-        # Update parameter, in place. Two flavors:
-        #   - "spectra"  : strict eq (4) `(1 - lambda*eta_k) X_k - eta_k v`, no cautious mask.
-        #   - otherwise  : existing cautious variant with mask-gated WD.
-        wd_update_fn = (
-            NorMuonAndAdam._spectra_wd_and_update_inplace
-            if p_cfg.orth_method == "spectra"
-            else NorMuonAndAdam._cautious_wd_and_update_inplace
+        # NorMuon variance reduction is applied on every path, including
+        # "spectra" (now aligned with "softclip" except for the SSC input).
+        red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
+        v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
+            v_chunk, p_state["second_momentum_buffer"], p_cfg.beta2, red_dim
         )
+
+        # Cautious weight update on every path, including "spectra".
+        wd_update_fn = NorMuonAndAdam._cautious_wd_and_update_inplace
         param_view = param.data.view(p_cfg.reshape)
         p_slice = param_view[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
 
         # MLP has per-matrix LR multipliers (c_proj gets 2x LR)
         if p_cfg.per_matrix_lr_mul is not None:
-            self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * _wd_scale)
+            self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
             for mat_idx in range(p_cfg.chunk_size):
                 self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.per_matrix_lr_mul[mat_idx] * p_cfg.lr)
                 wd_update_fn(
@@ -1713,74 +1807,48 @@ class CausalSelfAttention(nn.Module):
             seqlens = 2 * seqlens
             max_len = 2 * max_len
 
-        # MuonClip / QK-Clip capture: chunked (q @ k.mT) pass alongside flash attention to
-        # record per-head max pre-softmax logits (running max across grad_accum micro-batches;
-        # reset by apply_qk_clip after each optimizer step). Gated by global _CAPTURE_ATTN_LOGIT
-        # so training-hot-path cost is zero when disabled.
+        # MuonClip / QK-Clip capture: opaque windowed custom op that recomputes only
+        # the (q, k) pairs flash_attn actually softmaxes -- same packed sequence,
+        # causal, inside the sliding window (bm_size, 0). Running max across the
+        # grad_accum micro-batches lives in the model's attn_logit_max_per_head
+        # buffer; apply_qk_clip resets it after each optimizer step.
         #
-        # Only (q, k) pairs that flash_attn actually softmaxes are eligible for S^h_max in the
-        # Kimi K2 algorithm. flash_attn_varlen_func here is called with
-        #     cu_seqlens_q = cu_seqlens_k = seqlens, causal=True, window_size=(bm_size, 0)
-        # so a pair (q_pos, k_pos) is valid iff all three hold:
-        #     (1) same packed sequence  : seg[q_pos] == seg[k_pos]
-        #     (2) causal                : q_pos >= k_pos
-        #     (3) inside sliding window : q_pos - k_pos <= bm_size
-        # Naively taking amax over the full unmasked q @ k.mT would include cross-sequence
-        # pairs, future keys, and out-of-window keys -- none of which ever go through softmax
-        # in the real forward -- and would produce spurious S^h_max that fires QK-Clip on
-        # logits the model never actually computes.
+        # Gated by the global _CAPTURE_ATTN_LOGIT so the training hot path pays
+        # zero cost when MuonClip is off (and near-zero cost -- one custom op
+        # dispatch -- when it's on but this step isn't a capture step).
         #
-        # Note: with QK-norm active (line above), q,k are unit-normalized per token so this
-        # max stays bounded near yarn.attn_scale regardless of weight growth -- comment out
-        # `q, k = norm(q), norm(k)` to observe the Kimi K2 pathology.
+        # Layout after all transforms:
+        #   unpaired: q,k shape (B, T, H, D)     -> H_eff = num_heads,     T_eff = T
+        #   paired:   q,k shape (B, T*2, H/2, D) -> H_eff = num_heads//2, T_eff = 2T
+        # `seqlens` has already been doubled in the paired branch above, so the op
+        # sees a coherent T_eff-space view either way. For paired layers we feed
+        # the (H/2,) per-super-head slice of the buffer to the op and broadcast
+        # the result back into both head slots -- apply_qk_clip then applies the
+        # same gamma to both halves of the pair, which is correct.
+        #
+        # Note: with QK-norm active (commented out above), q,k are unit-normalized
+        # per token so the max stays bounded near yarn.attn_scale regardless of
+        # weight growth -- uncomment `q, k = norm(q), norm(k)` to hide the Kimi K2
+        # pathology.
         if _CAPTURE_ATTN_LOGIT:
-            with torch.no_grad():
-                # After all transforms:
-                #   unpaired: q,k shape (B, T, H, D)   -> H_eff = num_heads,     T_eff = T
-                #   paired:   q,k shape (B, T*2, H/2, D) -> H_eff = num_heads//2, T_eff = 2T
-                # In paired mode `seqlens` has already been doubled above, so all the
-                # position/segment reasoning below is done uniformly in the T_eff space.
-                q_bhtd = q.transpose(1, 2)          # (B, H_eff, T_eff, D)
-                k_bhtd = k.transpose(1, 2)
-                T_eff = q_bhtd.size(-2)
-                H_eff = q_bhtd.size(1)
-                chunk = 128
-                per_head_max = q.new_full((H_eff,), float("-inf"))
-
-                # Build seg_id[t] = which packed sequence token t belongs to.
-                # `seqlens` is the cu_seqlens tensor: [0, len0, len0+len1, ..., T_eff, T_eff, ...]
-                # (leading 0, trailing padding at T_eff for empty tail slots -- see the data
-                # loader). searchsorted with right=True on seqlens[1:] maps each position t to
-                # the smallest boundary strictly greater than t, i.e. its segment id; the
-                # trailing padding collapses to a fixed segment id for the tail region, which
-                # is exactly what flash_attn also treats as a single (final) segment.
-                positions = torch.arange(T_eff, device=q.device)
-                seg_id = torch.searchsorted(seqlens[1:].contiguous(), positions, right=True)
-
-                for i in range(0, T_eff, chunk):
-                    q_chunk = q_bhtd[:, :, i : i + chunk]
-                    logits = yarn.attn_scale * (q_chunk @ k_bhtd.mT)   # (B, H_eff, chunk_len, T_eff)
-
-                    q_pos = positions[i : i + chunk]                    # (chunk_len,)
-                    q_seg = seg_id[i : i + chunk]                       # (chunk_len,)
-                    delta = q_pos[:, None] - positions[None, :]         # (chunk_len, T_eff), can be negative
-                    valid = (
-                        (q_seg[:, None] == seg_id[None, :])             # same packed sequence
-                        & (delta >= 0)                                  # causal
-                        & (delta <= bm_size)                            # inside sliding window
-                    )
-                    logits = logits.masked_fill(~valid[None, None, :, :], float("-inf"))
-                    per_head_max = torch.maximum(per_head_max, logits.amax(dim=(0, 2, 3)))
-
-                if self.paired:
-                    # Paired layers merge adjacent heads into one super-head; duplicate
-                    # each super-head max into both head slots so apply_qk_clip below
-                    # applies the same scale to both halves of the pair (correct).
-                    per_head_max = per_head_max.repeat_interleave(2)
-                # Running max across grad_accum micro-batches; slice writes update the
-                # backing GPT.attn_logit_max_per_head buffer in place.
-                buf = attn_args.attn_logit_max_per_head_buf
-                torch.maximum(buf, per_head_max.detach().to(buf.dtype), out=buf)
+            buf = attn_args.attn_logit_max_per_head_buf   # (num_heads,) fp32
+            # In paired mode, buf[2i] == buf[2i+1] (duplicated on the previous
+            # capture), so buf[::2] is the per-super-head running max. Both buf
+            # and the op's output are fp32 by construction -- no casts needed.
+            prev = buf[::2] if self.paired else buf       # (H_eff,) fp32
+            new_per_head = torch.ops.train_gpt.windowed_attn_logit_max(
+                q.detach(),
+                k.detach(),
+                seqlens,
+                prev,
+                yarn.attn_scale,
+                bm_size,
+                args.attn_logit_query_chunk_size,
+            )
+            if self.paired:
+                buf.copy_(new_per_head.repeat_interleave(2))
+            else:
+                buf.copy_(new_per_head)
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
         y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
@@ -2309,7 +2377,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 
     while True:
         num_tokens_local = num_tokens // world_size
-        max_num_docs = TRAIN_MAX_NUM_DOCS.get(num_tokens_local, next_multiple_of_n(num_tokens_local // 300, n=128))
+        estimated_num_docs = max(1, num_tokens_local // 300)
+        max_num_docs = TRAIN_MAX_NUM_DOCS.get(num_tokens_local, next_multiple_of_n(estimated_num_docs, n=128))
 
         if align_to_bos:
             try:
@@ -2435,6 +2504,10 @@ class Hyperparameters:
     muonclip_alpha: float = 0.5
     muonclip_every: int = 30
     muonclip_end_step: int = 0
+    # Query rows processed by one windowed max-logit matmul in the QK-Clip capture
+    # custom op. Larger values launch fewer kernels but use more temporary memory;
+    # 512 matches the setting used in train_gpt_medium_spectra.py.
+    attn_logit_query_chunk_size: int = 512
 
 args = Hyperparameters()
 assert args.mode in ("adam", "adamw", "muon"), (
@@ -2626,7 +2699,7 @@ class TrainingManager():
         )
 
         normuon_defaults = dict(
-            lr=0.023,
+            lr=0.2,
             momentum=0.95,
             beta2=0.9,
             weight_decay=1.2,
@@ -2864,51 +2937,6 @@ for step in warmup_steps:
         del loss
     training_manager.step_optimizers(step)
     model.quantize_mlp_fp8()
-
-# MuonClip capture-path compile warmup. The training forward inside
-# CausalSelfAttention has a `if _CAPTURE_ATTN_LOGIT: ...` branch that torch.compile
-# does not exercise until the first real capture step (default step 30, per
-# args.muonclip_every) -- at which point dynamo detects the guard failure on
-# `_CAPTURE_ATTN_LOGIT == False`, re-traces the forward under the True flag,
-# Inductor lowers the searchsorted / chunked matmul / masked_fill / amax to
-# Triton, each unique chunk shape gets autotuned, and if CUDA graphs are on the
-# whole thing gets captured. That's the well-known "iteration 30 is slow" stall.
-#
-# Doing one throwaway forward here under `torch.no_grad()` with capture on
-# performs all of that work *now* (folded into the surrounding compile-warmup
-# phase, which is already discarded by the model reset below), so the first real
-# capture at step muonclip_every-1 is a plain cached-graph hit.
-#
-# Uses train_loader (not val_loader) because dynamo specializes on tensor shape
-# and the training and validation batches have different (batch_size, max_seq_len);
-# we need the training shape to match what step 30 will actually feed in. The
-# batch we consume here is discarded along with the loader itself a few lines
-# below, so it never enters real training. `read_and_reset_attn_logit_capture`
-# clears the running-max buffer (and warms up amax + dist.all_reduce along the
-# way); the try/finally guarantees the global flag is left False even if the
-# forward or the reduce raises.
-if args.use_muonclip:
-    print0("Warming up MuonClip capture path (compiles the _CAPTURE_ATTN_LOGIT=True forward)...", console=True)
-    model.train()
-    enable_attn_logit_capture()
-    try:
-        # Deliberately NOT under torch.no_grad(): dynamo installs a guard on
-        # torch.is_grad_enabled(), so a no_grad forward compiles a different
-        # specialization than the one step 30 will hit under normal training
-        # (which runs with autograd on because backward() follows). Beyond
-        # missing the warmup target, the no_grad + capture specialization has
-        # been observed to trip Inductor's lowering pass. Backward is not
-        # called, so gradients never actually accumulate on .grad -- the fwd
-        # graph is held only by the .mean() result, which goes out of scope on
-        # the next line and gets collected. `model.zero_grad(set_to_none=True)`
-        # further down is belt-and-suspenders.
-        send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens, bigram_inputs, _ = train_loader.send(send_args)
-        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
-        read_and_reset_attn_logit_capture(model)
-    finally:
-        disable_attn_logit_capture()
-
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
