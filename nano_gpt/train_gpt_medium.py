@@ -517,57 +517,6 @@ def softclip_muon(G: torch.Tensor, clip_D: float, steps: int = 8, split_baddbmm:
 
 
 # -----------------------------------------------------------------------------
-# SPECTRA variant of softclip_muon: same math, but takes clip_D as a 0-D
-# torch.Tensor instead of a Python float. Kept separate from softclip_muon so
-# that anyone using orth_method="softclip" outside SPECTRA gets the original
-# (float, value-baked-into-compile) function bit-for-bit unchanged.
-#
-# The reason SPECTRA needs a tensor path: under a non-trivial S_c schedule the
-# clipping threshold c_k changes every step. Passing that as a Python float to
-# a torch.compile'd function specializes on the value at trace time and
-# retriggers compilation on every distinct value -- deadly for the recompile
-# budget. Passing a persistent 0-D CUDA tensor (updated in-place via .fill_(c_k))
-# keeps the graph identical across steps: same tensor object, same shape, same
-# dtype, only the runtime value differs.
-
-@torch.compile(dynamic=False, fullgraph=True)
-def softclip_muon_dyn(G: torch.Tensor, clip_D: torch.Tensor, steps: int = 8, split_baddbmm: bool = False):
-    """
-    Same as softclip_muon, but clip_D is a 0-D torch.Tensor (dynamic value).
-    Used by the SPECTRA path. split_baddbmm is accepted for interface
-    compatibility but unused.
-    """
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    batched = X.ndim > 2
-    bmm = torch.bmm if batched else torch.mm
-    # clip_D is already a tensor; just cast dtype to match X.
-    D = clip_D.to(dtype=X.dtype)
-
-    M = bmm(X, X.mT) if batched else X @ X.mT
-    n = M.size(-1)
-    I = torch.eye(n, device=X.device, dtype=X.dtype).expand_as(M).clone()
-    M = M + (D * D) * I
-    alpha = M.norm(dim=(-2, -1), keepdim=True) + 1e-6
-    Y = M / alpha
-    Z = I.clone()
-    for _ in range(steps):
-        ZY = bmm(Z, Y) if batched else Z @ Y
-        T = 0.5 * (3 * I - ZY)
-        Y = bmm(Y, T) if batched else Y @ T
-        Z = bmm(T, Z) if batched else T @ Z
-    invsqrt = Z / alpha.sqrt()
-
-    out = D * (bmm(invsqrt, X) if batched else invsqrt @ X)
-
-    if G.size(-2) > G.size(-1):
-        out = out.mT
-    return out
-
-
-# -----------------------------------------------------------------------------
 # Frank-Wolfe spectral clip: alternative to softclip_muon for the same goal
 # (cap singular values at D), via the variational characterization:
 #     min_{X: ||X||_2 <= D} 1/2 ||X - G||_F^2
@@ -677,23 +626,6 @@ def cautious_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
     wd_factor = wd_tensor.to(p.dtype)
     lr_factor = lr_tensor.to(p.dtype)
     p.copy_(p - (p * mask * wd_factor * lr_factor) - (v * lr_factor))
-
-
-@torch.compile(dynamic=False, fullgraph=True)
-def spectra_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
-    """
-    Strict SPECTRA eq (4) parameter update, no cautious mask:
-        p <- p - (p * wd_factor * lr_factor) - (v * lr_factor)
-             = (1 - lambda*eta_k) p  -  eta_k * v
-    The mask-free form matches eq (4)'s "(1 - lambda*eta_k) X_k" verbatim.
-    Kept separate from cautious_wd_and_update_inplace so no other orth_method
-    is affected. wd_tensor and lr_tensor are 0-D CPU tensors; under SPECTRA
-    wd_tensor omits the extra `* group["lr"]` factor (see eff_wd_all
-    computation) so wd_factor * lr_factor evaluates to lambda * eta_k.
-    """
-    wd_factor = wd_tensor.to(p.dtype)
-    lr_factor = lr_tensor.to(p.dtype)
-    p.copy_(p - (p * wd_factor * lr_factor) - (v * lr_factor))
 
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -856,27 +788,9 @@ class NorMuon(torch.optim.Optimizer):
             if "momentum_buffer" not in group:
                 group["momentum_buffer"]  = torch.zeros_like(grad_chunk[:num_params])
             momentum_buffer = group["momentum_buffer"]
-            # Apply momentum update to the persistent momentum buffer in-place.
-            # This is paper eq (4)'s M_{k+1} = (1 - beta_k) M_k + beta_k g,
-            # with paper's beta_k <-> code's (1 - group["momentum"]).
+            # Apply momentum update to the persistent momentum buffer in-place
             momentum_buffer.lerp_(grad_chunk[:num_params], 1 - group["momentum"])
-
-            # Fetch orth_method here (earlier than the dispatch below) so we can
-            # skip the Nesterov-style lookahead computation entirely under
-            # SPECTRA -- eq (4) uses M_k directly and does not include this
-            # extra combine step, so faithfully reproducing (4) means not
-            # computing it. For every other orth_method the behavior below is
-            # bit-identical to before.
-            orth_method = group.get("orth_method", "polar_express")
-            if orth_method == "spectra":
-                # No Nesterov lookahead under SPECTRA. Alias updated_grads to
-                # the raw gradient view -- its VALUES are unused (the SPECTRA
-                # branch feeds momentum_buffer to SSC), but its SHAPE is still
-                # needed downstream for grad_shape, second_momentum_buffer
-                # allocation, and the num_params==0 fallback.
-                updated_grads = grad_chunk[:num_params]
-            else:
-                updated_grads = grad_chunk[:num_params].lerp_(momentum_buffer, group["momentum"])
+            updated_grads = grad_chunk[:num_params].lerp_(momentum_buffer, group["momentum"])
 
             grad_shape = updated_grads.shape
             if params[module_idx].label == 'attn':
@@ -922,22 +836,7 @@ class NorMuon(torch.optim.Optimizer):
                 group["param_wd_cpu"] = torch.tensor(wd_mults, dtype=torch.float32, device="cpu")
 
             eff_lr_all = group["param_lr_cpu"] * group["lr"]
-            # SPECTRA (eq 4) WD term is `(1 - lambda*eta_k) X_k`, i.e. one
-            # eta_k factor. The stock cautious update computes the WD
-            # coefficient as `wd_factor * lr_factor`, so if `wd_factor` also
-            # carries an eta_k factor we end up with lambda*eta_k^2 -- an extra
-            # eta_k vs paper. To restore eq (4) exactly on the SPECTRA path
-            # WITHOUT touching cautious_wd_and_update_inplace (and therefore
-            # without changing any other orth_method's behavior), drop the
-            # `* group["lr"]` here for the "spectra" orth_method only. The
-            # `lr_factor` inside the compiled function still supplies exactly
-            # one eta_k to the WD term, matching eq (4). Every other
-            # orth_method (including the legacy "softclip") keeps the
-            # existing `lambda * eta_k^2` behavior bit-for-bit.
-            if group.get("orth_method") == "spectra":
-                eff_wd_all = group["param_wd_cpu"] * group["weight_decay"]
-            else:
-                eff_wd_all = group["param_wd_cpu"] * group["weight_decay"] * group["lr"]
+            eff_wd_all = group["param_wd_cpu"] * group["weight_decay"] * group["lr"]
 
             # Slice the portion corresponding to this rank's shard
             eff_lr_cpu = eff_lr_all[module_idx:module_idx + num_params]
@@ -947,11 +846,14 @@ class NorMuon(torch.optim.Optimizer):
             # Dispatch based on group["orth_method"] (defaults to "polar_express"):
             #   "polar_express"               -- original Polar Express (Triton kernels, optimized schedule)
             #   "vanilla_muon_no_triton"      -- fixed Muon coefficients, plain PyTorch matmuls
-            #   "softclip"                    -- soft spectral clip; requires group["clip_D"] (float)
-            #   "spectra"                     -- SPECTRA eq (4) with SSC(M_k); requires group["clip_D"] (0-D tensor)
+            #   "softclip"                    -- soft spectral clip on Nesterov lookahead; group["clip_D"] (float)
+            #   "spectra"                     -- soft spectral clip on M_k; group["clip_D"] (float)
             #   "frankwolfe"                  -- Frank-Wolfe fixed-step spectral clip; requires group["clip_D"]
             #   "frankwolfe_linesearch"       -- Frank-Wolfe exact line-search clip; requires group["clip_D"]
-            # (orth_method already fetched above, before the Nesterov-lookahead gate.)
+            # NorMuon variance reduction and the cautious WD update apply on every path,
+            # so "spectra" is identical to "softclip" except that it clips M_k directly
+            # instead of the Nesterov lookahead. Same kernel, same float clip_D plumbing.
+            orth_method = group.get("orth_method", "polar_express")
             split = (ref_param.label == 'mlp')
             if num_params == 0:
                 v_chunk = updated_grads
@@ -961,20 +863,19 @@ class NorMuon(torch.optim.Optimizer):
                 clip_D = group.get("clip_D", 1.0)
                 v_chunk = softclip_muon(updated_grads, clip_D=clip_D, split_baddbmm=split)
             elif orth_method == "spectra":
-                # SPECTRA eq (4):  X_{k+1} = (1 - lambda*eta_k)X_k - alpha*eta_k * SSC(M_k)
-                # The paper applies SSC to the Polyak momentum buffer M_k directly.
-                # NorMuon/Muon's `updated_grads` is a Nesterov-style lookahead
-                # ((1-beta)*g + beta*M_k, algebraically (1-beta^2)*g + beta^2*M_{k-1}),
-                # NOT the M_k eq (4) prescribes -- so we feed `momentum_buffer` in
-                # instead. It was already EMA-updated above via lerp_ and IS paper's M_k
-                # (paper's beta_k <-> code's (1 - group["momentum"])).
+                # Soft spectral clip applied to the Polyak momentum buffer M_k directly,
+                # NOT to `updated_grads` (which is the Nesterov lookahead
+                # (1-beta)*g + beta*M_k). `momentum_buffer` was EMA-updated above via
+                # lerp_ and IS paper's M_k (paper's beta_k <-> code's (1 - group["momentum"])).
                 # Reshape it the same way `updated_grads` was reshaped for 'attn' groups.
+                # clip_D is a Python float (constant across the run), same plumbing
+                # as the "softclip" path.
                 m_k = momentum_buffer
                 if params[module_idx].label == 'attn':
                     m_k = m_k.view(4 * grad_shape[0], grad_shape[1] // 4, grad_shape[2])
-                clip_D = group["clip_D"]                     # 0-D CUDA tensor, updated in-place per step
-                ns_steps = group.get("spectra_ns_steps", 8)  # N_s in SPECTRA Algorithm 2
-                v_chunk = softclip_muon_dyn(m_k, clip_D=clip_D, steps=ns_steps, split_baddbmm=split)
+                clip_D = group.get("clip_D", 1.0)
+                ns_steps = group.get("spectra_ns_steps", 8)
+                v_chunk = softclip_muon(m_k, clip_D=clip_D, steps=ns_steps, split_baddbmm=split)
             elif orth_method == "frankwolfe":
                 clip_D = group.get("clip_D", 1.0)
                 v_chunk = frankwolfe_clip_muon(updated_grads, clip_D=clip_D, split_baddbmm=split)
@@ -988,54 +889,54 @@ class NorMuon(torch.optim.Optimizer):
             # is 'incorrect' for O. However, correcting this showed no improvement. @chrisjmccormick
             red_dim = -1 if (is_gate or param_shape[-2] >= param_shape[-1]) else -2
 
-            # SPECTRA eq (4) is a plain " -alpha*eta_k * SSC(M_k) " update with no
-            # extra NorMuon post-scaling. Skip variance reduction on the SPECTRA
-            # path so the update matches eq (4) exactly. All other orth_methods
-            # (including the legacy "softclip") retain variance reduction.
-            # The second_momentum_buffer is still allocated above (harmless
-            # memory cost, keeps the buffer-init branch simple) but never
-            # populated under SPECTRA.
-            if orth_method != "spectra":
-                v_chunk = apply_normuon_variance_reduction(
-                    v_chunk, second_momentum_buffer, group["beta2"], red_dim
-                )
+            v_chunk = apply_normuon_variance_reduction(
+                v_chunk, second_momentum_buffer, group["beta2"], red_dim
+            )
 
-            # SPECTRA (eq 4): apply alpha to the SSC term. Scaling v_chunk here
-            # -- before cautious_wd_and_update_inplace, which multiplies by
-            # eff_lr = eta_k -- produces the "-alpha * eta_k * v_chunk" term
-            # of X_{k+1}. Gated on orth_method == "spectra" so no other
-            # orth_method is affected; the additional `spectra_alpha != 1.0`
-            # check avoids a full read/write of v_chunk when alpha is trivially 1.
-            if orth_method == "spectra":
-                spectra_alpha = group.get("spectra_alpha", 1.0)
-                if spectra_alpha != 1.0:
-                    v_chunk = v_chunk * spectra_alpha
+            # Configuration-only update scale, applied after variance reduction
+            # so its running second-moment state is unchanged. Shared between
+            # "softclip" and "spectra" -- spectra no longer has a separate
+            # alpha; it uses the same softclip_update_scale knob.
+            if orth_method in ("softclip", "spectra"):
+                softclip_update_scale = group.get("softclip_update_scale", 1.0)
+                if softclip_update_scale != 1.0:
+                    v_chunk.mul_(softclip_update_scale)
 
             v_chunk = v_chunk.view(grad_shape)
 
-            # Weight-decay + parameter update. Two flavors:
-            #   - "spectra"  : strict eq (4) `(1 - lambda*eta_k) X_k - eta_k v`,
-            #                  no cautious mask (eq (4) doesn't have one).
-            #   - otherwise  : the existing cautious variant with mask-gated WD
-            #                  (https://arxiv.org/abs/2510.12402), unchanged.
-            # The dispatch is a Python-level function pick before the inner
-            # loop, so neither compiled function pays a per-iteration branch cost.
-            wd_update_fn = (
-                spectra_wd_and_update_inplace
-                if orth_method == "spectra" else cautious_wd_and_update_inplace
-            )
+            # # "Cautious" weight decay (https://arxiv.org/abs/2510.12402)
             updated_params = torch.empty_like(grad_chunk)
             if num_params > 0:
                 # Work on a stacked copy to avoid touching original params
                 param_chunk = torch.stack(params[module_idx:module_idx + num_params])
 
                 for local_idx in range(num_params):
-                    wd_update_fn(
-                        param_chunk[local_idx],
-                        v_chunk[local_idx],
-                        eff_wd_cpu[local_idx],
-                        eff_lr_cpu[local_idx],
-                    )
+                    local_param = params[module_idx + local_idx]
+                    if local_param.label == 'attn':
+                        # qkvo_w is laid out as Q, K, V, O in four equal row
+                        # blocks. Separate QK/VO WD controls require no change
+                        # to the spectral update itself.
+                        block_rows = param_chunk[local_idx].shape[-2] // 4
+                        qk_end = 2 * block_rows
+                        cautious_wd_and_update_inplace(
+                            param_chunk[local_idx, :qk_end],
+                            v_chunk[local_idx, :qk_end],
+                            eff_wd_cpu[local_idx] * group.get("qk_wd_mul", 1.0),
+                            eff_lr_cpu[local_idx],
+                        )
+                        cautious_wd_and_update_inplace(
+                            param_chunk[local_idx, qk_end:],
+                            v_chunk[local_idx, qk_end:],
+                            eff_wd_cpu[local_idx] * group.get("vo_wd_mul", 1.0),
+                            eff_lr_cpu[local_idx],
+                        )
+                    else:
+                        cautious_wd_and_update_inplace(
+                            param_chunk[local_idx],
+                            v_chunk[local_idx],
+                            eff_wd_cpu[local_idx],
+                            eff_lr_cpu[local_idx],
+                        )
             else:
                 param_chunk = torch.zeros_like(v_chunk)
 
@@ -2101,24 +2002,6 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
         momentum = momentum_max
     return momentum
 
-# SPECTRA clipping schedule S_c(c, k) from Algorithm 2 of "Enhancing LLM Training
-# via Spectral Clipping". Returns the per-step clipping threshold c_k passed to
-# SSC_{c_k}(U_k, N_s). Defaults to a constant schedule (c_k = c) when
-# spectra_clip_warmup_steps == 0, which is the trivial S_c and reproduces the
-# original constant-clip_D behavior. When spectra_clip_warmup_steps > 0, does a
-# linear warmup from spectra_clip_start to spectra_c over that many steps -- this
-# is a mild curriculum that starts with a tighter clip and relaxes it, useful
-# when the pre-optimizer update U_k has large early-training singular values.
-def get_spectra_clip_D(step: int,
-                       spectra_c: float,
-                       spectra_clip_start: float,
-                       spectra_clip_warmup_steps: int = 0):
-    if spectra_clip_warmup_steps <= 0:
-        return spectra_c
-    if step >= spectra_clip_warmup_steps:
-        return spectra_c
-    frac = step / spectra_clip_warmup_steps
-    return spectra_clip_start + frac * (spectra_c - spectra_clip_start)
 
 class TrainingManager():
     """
@@ -2153,37 +2036,36 @@ class TrainingManager():
         muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
         assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + scalar_labels + muon_labels), "All params must have label"
 
+        # MLP WD is parameter-level in this model. Attention uses a fused QKVO
+        # parameter, so its QK/VO multipliers are applied by block in NorMuon.step.
+        for param in muon_params:
+            if param.label == 'mlp':
+                param.wd_mul = args.mlp_wd_mul
+
         if args.optimizer_type == "muon":
             # ---- Default: three-optimizer Muon hybrid (original behavior). ----
             self.adam_opt = DistAdam(adam_params, adam_labels, lr=0.004, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.005)
             self.scalar_opt = DistAdam(scalar_params, scalar_labels, lr=0.008, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.005)
-            self.muon_opt = NorMuon(muon_params, lr=0.1, momentum=0.95, beta2=0.95, weight_decay=1.2)
+            self.muon_opt = NorMuon(
+                muon_params,
+                lr=args.normuon_lr,
+                momentum=0.95,
+                beta2=0.95,
+                weight_decay=1.2,
+            )
 
             for group in self.muon_opt.param_groups:
-                if args.use_spectra:
-                    # SPECTRA: use the dedicated "spectra" orth_method (see
-                    # NorMuon.step for its eq (4) update). c_k is stored as a
-                    # persistent 0-D CUDA tensor and refreshed in
-                    # step_optimizers via .fill_() to avoid torch.compile
-                    # recompilation on value change. alpha and N_s are stored
-                    # per-group and consumed inside NorMuon.step.
-                    group["orth_method"] = "spectra"
-                    initial_clip = get_spectra_clip_D(
-                        0,
-                        spectra_c=args.spectra_c,
-                        spectra_clip_start=args.spectra_clip_start,
-                        spectra_clip_warmup_steps=args.spectra_clip_warmup_steps,
-                    )
-                    group["clip_D"] = torch.tensor(
-                        initial_clip, device=device, dtype=torch.bfloat16,
-                    )
-                    group["spectra_alpha"] = args.spectra_alpha
-                    group["spectra_ns_steps"] = args.spectra_ns_steps
-                else:
-                    group["orth_method"] = "vanilla_muon_no_triton"
-                    group["clip_D"] = 1.0
-                    group["spectra_alpha"] = 1.0
-                    group["spectra_ns_steps"] = 8
+                group["qk_wd_mul"] = args.qk_wd_mul
+                group["vo_wd_mul"] = args.vo_wd_mul
+                group["softclip_update_scale"] = args.softclip_update_scale
+                group["orth_method"] = args.orth_method
+                group["clip_D"] = args.clip_D
+                # spectra_ns_steps is only consumed on the "spectra" path (N_s
+                # Newton-Schulz iterations inside softclip_muon); harmless
+                # constant for other orth_methods.
+                group["spectra_ns_steps"] = (
+                    args.spectra_ns_steps if args.orth_method == "spectra" else 8
+                )
 
             self.optimizers = [self.adam_opt, self.scalar_opt, self.muon_opt]
         else:
@@ -2286,23 +2168,8 @@ class TrainingManager():
         step_lr = get_lr(step)
         if self.muon_opt is not None:
             muon_momentum = get_muon_momentum(step)
-            # SPECTRA c_k = S_c(c, k). When use_spectra=False this is a no-op
-            # (clip_D stays fixed at the value set in __init__).
-            spectra_clip_D = (
-                get_spectra_clip_D(
-                    step,
-                    spectra_c=args.spectra_c,
-                    spectra_clip_start=args.spectra_clip_start,
-                    spectra_clip_warmup_steps=args.spectra_clip_warmup_steps,
-                )
-                if args.use_spectra else None
-            )
             for group in self.muon_opt.param_groups:
                 group["momentum"] = muon_momentum
-                if spectra_clip_D is not None:
-                    # In-place fill on the persistent 0-D tensor. Same tensor
-                    # object across steps -> no torch.compile recompilation.
-                    group["clip_D"].fill_(spectra_clip_D)
 
         for opt in self.optimizers:
             if opt.freeze_timer > 0:
@@ -2359,8 +2226,8 @@ class TrainingManager():
 @dataclass
 class Hyperparameters:
     # data
-    train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    train_files: str = "data/c4_en/c4_train_*.bin" # input .bin to train on
+    val_files: str = "data/c4_en/c4_val_*.bin"# input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     train_bs_schedule: tuple = (131072, 262144, 393216, 524288, 
@@ -2384,7 +2251,16 @@ class Hyperparameters:
     # (adam_opt + scalar_opt + muon_opt) unchanged. "adamw" or "adam" collapses
     # everything into a single DistAdam that optimizes ALL parameters -- for
     # ablation baselines. In "adam" mode, weight_decay is forced to 0.
-    optimizer_type: str = "muon"       # "muon" | "adamw" | "adam"
+    optimizer_type: str = os.environ.get("MODE", "muon")  # "muon" | "adamw" | "adam"
+    normuon_lr: float = float(os.environ.get("NORMUON_LR", "0.023"))
+    orth_method: str = os.environ.get("ORTH_METHOD", "softclip")
+    clip_D: float = float(os.environ.get("CLIP_D", "0.5"))
+    softclip_update_scale: float = float(
+        os.environ.get("SOFTCLIP_UPDATE_SCALE", "1.0")
+    )
+    qk_wd_mul: float = float(os.environ.get("QK_WD_MUL", "1.0"))
+    vo_wd_mul: float = float(os.environ.get("VO_WD_MUL", "1.0"))
+    mlp_wd_mul: float = float(os.environ.get("MLP_WD_MUL", "0.25"))
     baseline_lr: float = 0.004         # LR for the all-Adam baselines 0.0267对应 muon步长0.1
     baseline_weight_decay: float = 0.005    # WD for the "adamw" baseline
     baseline_betas: tuple = (0.9, 0.95)     # betas for the all-Adam baselines
@@ -2400,52 +2276,25 @@ class Hyperparameters:
     # Query rows processed by one windowed max-logit matmul. Larger values launch
     # fewer kernels but use more temporary memory; 512 is modest on an H800.
     attn_logit_query_chunk_size: int = 512
-    # ----- SPECTRA (Polyak-momentum instantiation, eq (4) of "Enhancing LLM
-    # Training via Spectral Clipping") -----
-    # When True, the NorMuon (Muon-family) optimizer runs the SPECTRA update
-    # in the exact form eq (4) prescribes:
-    #     X_{k+1} = (1 - lambda*eta_k) X_k  -  alpha * eta_k * clip^sp_{c_k}(M_k)
-    #     M_{k+1} = (1 - beta_k) M_k  +  beta_k * g(X_{k+1})
-    # where:
-    #   - M_k is the Polyak EMA momentum buffer (code's momentum_buffer AFTER
-    #     the in-place lerp_; paper's beta_k <-> code's 1 - group["momentum"]),
-    #   - clip^sp_{c_k}(., N_s) is the soft-spectral-clip via `softclip_muon`,
-    #   - c_k is produced by S_c (see get_spectra_clip_D),
-    #   - eta_k comes from the existing LR schedule (get_lr),
-    #   - lambda is the group weight_decay,
-    #   - alpha is spectra_alpha below.
-    # Pre-SPC (the optional raw-gradient pre-clip) is intentionally omitted.
-    #
-    # Deviations from stock NorMuon that this path introduces to match eq (4):
-    #   * SSC is applied to `momentum_buffer` (M_k) directly, NOT to the
-    #     Nesterov-style lookahead `updated_grads` that NorMuon otherwise uses.
-    #     The Nesterov lookahead lerp is also SKIPPED under SPECTRA (not just
-    #     unused) -- eq (4) is a pure Polyak momentum update, no lookahead.
-    #   * NorMuon's variance-reduction post-scaling is skipped -- eq (4) has
-    #     no such factor. It's a bare "-alpha*eta_k*SSC(M_k)" on the SSC term.
-    #   * WD-term eta_k factor: `eff_wd_all` for spectra groups omits the
-    #     extra `* group["lr"]`, so the coefficient
-    #     `wd_factor * lr_factor` inside the WD update becomes
-    #     `param_wd_cpu * param_lr_cpu * lambda * eta_k` (one eta_k, matching
-    #     eq (4)) instead of `... * lambda * eta_k^2`.
-    #   * Cautious mask on the WD term is DROPPED. Eq (4)'s
-    #     "(1 - lambda*eta_k) X_k" is a plain multiply, not a mask-gated one.
-    #     A dedicated `spectra_wd_and_update_inplace` is used for the SPECTRA
-    #     path; every other orth_method still hits the original mask-gated
-    #     `cautious_wd_and_update_inplace` bit-for-bit.
-    use_spectra: bool = False
-    spectra_c: float = 1.0                # base clip threshold c (used by S_c)
-    spectra_alpha: float = 1.0            # alpha coefficient in the SSC update
+    # ----- Spectral clip on the momentum buffer (spectra orth_method) -----
+    # With ORTH_METHOD=spectra, the NorMuon optimizer runs a soft spectral clip
+    # applied to the Polyak momentum buffer M_k with a constant clip threshold
+    # (args.clip_D). This is identical to the "softclip" path in every respect
+    # (NorMuon variance reduction, cautious mask-gated WD, `lambda*eta_k^2` WD
+    # factor, shared softclip_update_scale post-scaling, same softclip_muon
+    # kernel with a Python-float clip_D) EXCEPT that SSC is applied to
+    # `momentum_buffer` (M_k) instead of the Nesterov-style lookahead
+    # `updated_grads = (1-beta)*g + beta*M_k` that softclip uses.
     spectra_ns_steps: int = 8             # N_s: Newton-Schulz steps in SSC
-    spectra_clip_warmup_steps: int = 0    # >0 enables linear warmup of c_k
-    spectra_clip_start: float = 1.0       # c_k at step 0 during warmup
     # ----- MuonClip / QK-Clip (Kimi K2 Algorithm 1) -----
     # When True, applies interval QK-Clip: every muonclip_every training steps,
     # capture per-head max attention logits and apply QK-Clip after that optimizer
     # step. Intervening steps and validation do not run the manual q@k pass.
     # NOTE: with QK-norm active this is essentially a no-op -- disable QK-norm
     # in the attention forward to see QK-Clip actually fire.
-    use_muonclip: bool = True
+    use_muonclip: bool = os.environ.get("USE_MUONCLIP", "0").lower() in (
+        "1", "true", "yes", "on"
+    )
     muonclip_tau: float = 100.0
     muonclip_alpha: float = 0.5
     muonclip_every: int = 30
@@ -2471,6 +2320,27 @@ class Hyperparameters:
     ws_validate_post_yarn_ext: int = 27 # extend long windows out even further after applying YaRN
 
 args = Hyperparameters()
+
+_VALID_ORTH_METHODS = (
+    "polar_express",
+    "vanilla_muon_no_triton",
+    "softclip",
+    "spectra",
+    "frankwolfe",
+    "frankwolfe_linesearch",
+)
+assert args.optimizer_type in ("muon", "adamw", "adam"), (
+    f"Invalid MODE={args.optimizer_type!r}; expected 'muon', 'adamw', or 'adam'"
+)
+assert args.orth_method in _VALID_ORTH_METHODS, (
+    f"Invalid ORTH_METHOD={args.orth_method!r}; expected one of {_VALID_ORTH_METHODS}"
+)
+assert args.normuon_lr > 0.0, "NORMUON_LR must be positive"
+assert args.clip_D > 0.0, "CLIP_D must be positive"
+assert args.softclip_update_scale > 0.0, "SOFTCLIP_UPDATE_SCALE must be positive"
+assert args.qk_wd_mul >= 0.0, "QK_WD_MUL must be non-negative"
+assert args.vo_wd_mul >= 0.0, "VO_WD_MUL must be non-negative"
+assert args.mlp_wd_mul >= 0.0, "MLP_WD_MUL must be non-negative"
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
@@ -2521,10 +2391,34 @@ def get_attn_param_max(model: nn.Module) -> tuple[float, float]:
         dist.all_reduce(param_abs_max, op=dist.ReduceOp.MAX)
     return param_max.item(), param_abs_max.item()
 
-# begin by printing this file (the Python code)
+effective_clip_D = (
+    str(args.clip_D)
+    if args.orth_method in ("softclip", "spectra", "frankwolfe", "frankwolfe_linesearch")
+    else "unused"
+)
+effective_softclip_scale = (
+    str(args.softclip_update_scale)
+    if args.orth_method == "softclip"
+    else "unused"
+)
+print0(
+    "Optimizer config: "
+    f"mode={args.optimizer_type} "
+    f"base_lr={args.normuon_lr} "
+    f"orth_method={args.orth_method} "
+    f"use_muonclip={args.use_muonclip} "
+    f"clip_D={effective_clip_D} "
+    f"softclip_update_scale={effective_softclip_scale} "
+    f"qk_wd_mul={args.qk_wd_mul} "
+    f"vo_wd_mul={args.vo_wd_mul} "
+    f"mlp_wd_mul={args.mlp_wd_mul}",
+    console=True,
+)
+
+# Record the resolved experiment configuration before the source/environment
+# dump so it is visible at the beginning of both console output and the log.
 print0(code)
 print0("="*100)
-# log information about the hardware/software environment this is running on
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
@@ -2617,6 +2511,49 @@ if args.use_muonclip:
 # Latch: True while MuonClip is running, False after it self-disables via
 # muonclip_end_step. Used to print the deactivation message exactly once.
 _muonclip_active = args.use_muonclip
+
+# --- Hot-started power iteration for per-bank top-singular-value logging ---
+# The medium model stores Q/K/V/O in one qkvo_w tensor per layer, so split each
+# tensor into four equal matrices and aggregate QK and VO separately. MLP logging
+# aggregates every layer's c_fc and c_proj matrices. The cached right-singular
+# vectors make later measurements cheaper than the first one.
+_SIGMA_LOG_EVERY = 50
+_top_sigma_v: dict[str, torch.Tensor] = {}
+
+@torch.no_grad()
+def _bank_top_sigma(bank: torch.Tensor, v: torch.Tensor, num_iters: int):
+    """Estimate the largest singular value across a bank of (m, n) matrices."""
+    B = bank.detach().float()
+    v = v / (v.norm(dim=-1, keepdim=True) + 1e-12)
+    sigma = None
+    for _ in range(num_iters):
+        u = torch.bmm(B, v.unsqueeze(-1)).squeeze(-1)
+        u = u / (u.norm(dim=-1, keepdim=True) + 1e-12)
+        v_new = torch.bmm(B.transpose(-1, -2), u.unsqueeze(-1)).squeeze(-1)
+        sigma = v_new.norm(dim=-1)
+        v = v_new / (sigma.unsqueeze(-1) + 1e-12)
+    return sigma.amax(), v
+
+@torch.no_grad()
+def _medium_sigma_banks(compiled_model: nn.Module) -> dict[str, torch.Tensor]:
+    """Build QK, VO, and MLP matrix banks from the medium model's parameters."""
+    base = getattr(compiled_model, "_orig_mod", compiled_model)
+    qk_matrices = []
+    vo_matrices = []
+    mlp_matrices = []
+    for block in base.blocks:
+        qkvo = block.attn.qkvo_w.detach().view(
+            4, block.attn.dim, block.attn.hdim
+        )
+        qk_matrices.extend(qkvo[:2].unbind(0))
+        vo_matrices.extend(qkvo[2:].unbind(0))
+        mlp_matrices.extend((block.mlp.c_fc.detach(), block.mlp.c_proj.detach()))
+
+    return {
+        "qk_bank": torch.stack(qk_matrices),
+        "vo_bank": torch.stack(vo_matrices),
+        "mlp_bank": torch.stack(mlp_matrices),
+    }
 
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
@@ -2713,6 +2650,33 @@ for step in range(train_steps + 1):
             f"skipping interval QK-Clip and q@k measurement from now on.",
             console=True,
         )
+
+    # Print the maximum top singular value in each logical weight bank every
+    # 50 completed optimizer steps, matching train_gpt.py's log format.
+    if master_process and (step + 1) % _SIGMA_LOG_EVERY == 0:
+        sigma_banks = _medium_sigma_banks(model)
+        parts = []
+        for bank_name in ("qk_bank", "vo_bank", "mlp_bank"):
+            bank = sigma_banks[bank_name]
+            K, _, n = bank.shape
+            if bank_name not in _top_sigma_v:
+                _top_sigma_v[bank_name] = torch.randn(
+                    K, n, device=bank.device, dtype=torch.float32
+                )
+                num_iters = 10
+            else:
+                num_iters = 3
+
+            sigma_top, v_new = _bank_top_sigma(
+                bank, _top_sigma_v[bank_name], num_iters
+            )
+            _top_sigma_v[bank_name] = v_new
+            parts.append(f"{bank_name}:{sigma_top.item():.4f}")
+
+        print0(f"step:{step+1} sigma_top " + " ".join(parts), console=True)
+        # These banks are stacked diagnostic copies, so release them immediately
+        # instead of retaining several hundred MB until the next log step.
+        del sigma_banks, bank
 
     # logging
     attn_param_max, attn_param_abs_max = get_attn_param_max(model)
