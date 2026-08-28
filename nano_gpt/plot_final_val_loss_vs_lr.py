@@ -5,8 +5,13 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+method_dict = {"muon":"Muon", "muonclip":"MuonClip", "spectra":"SPECTRA", "softclip":"Soft Musec"}
+
+import os
 
 PLOT_DIR = Path(__file__).resolve().parent
+PLOT_DIR = PLOT_DIR / "c4" / "medium"
+
 LOG_RE = re.compile(r"^(?P<method>.+)_1gpu_(?P<lr>\d+(?:\.\d+)?)\.log$")
 VAL_RE = re.compile(
     r"step:(\d+)/(\d+)\s+val_loss:([-+]?(?:\d+(?:\.\d*)?|\.\d+)"
@@ -57,6 +62,8 @@ for method, paths in logs.items():
             f"at step {last_step}/{total_steps} ({path.name})"
         )
 
+#results["muonclip"].pop()
+
 if not results:
     raise ValueError("The discovered log files contain no validation-loss records")
 
@@ -77,10 +84,11 @@ for index, (method, method_results) in enumerate(sorted(results.items())):
         color=color,
         linewidth=2,
         markersize=9,
-        label=method,
+        label=method_dict[method],
     )
 
     y_offset = 8 if index % 2 == 0 else -14
+    """
     for lr, value, _last_step, _total_steps in method_results:
         if np.isfinite(value):
             ax.annotate(
@@ -91,13 +99,24 @@ for index, (method, method_results) in enumerate(sorted(results.items())):
                 fontsize=8,
                 color=color,
             )
+    """
 
 ax.set_xscale("log")
-ax.set_xlabel("Learning rate", fontsize=12)
-ax.set_ylabel("Final validation loss", fontsize=12)
-ax.set_title("Final validation loss vs. learning rate", fontsize=13)
+ax.set_xlabel("Learning rate", fontsize=24)
+ax.set_ylabel("Final validation loss", fontsize=24)
+ax.tick_params(axis='both', which='major', labelsize=24)
 ax.grid(True, which="both", alpha=0.3)
-ax.legend(fontsize=10, loc="best")
+ax.legend(fontsize=24, loc="best")
+
+# 2. Extract current handles and labels
+handles, labels = plt.gca().get_legend_handles_labels()
+
+# 3. Define your desired order by index (e.g., Line C, then Line A, then Line B)
+order = [0,1,3,2]
+
+# 4. Pass the reordered lists to plt.legend()
+plt.legend([handles[idx] for idx in order], [labels[idx] for idx in order], fontsize=14)
+
 
 plt.tight_layout()
 output_path = PLOT_DIR / "final_val_loss_vs_lr.png"
