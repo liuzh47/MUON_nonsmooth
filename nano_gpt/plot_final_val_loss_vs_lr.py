@@ -10,7 +10,7 @@ method_dict = {"muon":"Muon", "muonclip":"MuonClip", "spectra":"SPECTRA", "softc
 import os
 
 PLOT_DIR = Path(__file__).resolve().parent
-PLOT_DIR = PLOT_DIR / "c4" / "medium"
+PLOT_DIR = PLOT_DIR / "c4" / "small"
 
 LOG_RE = re.compile(r"^(?P<method>.+)_1gpu_(?P<lr>\d+(?:\.\d+)?)\.log$")
 VAL_RE = re.compile(
@@ -62,7 +62,7 @@ for method, paths in logs.items():
             f"at step {last_step}/{total_steps} ({path.name})"
         )
 
-#results["muonclip"].pop()
+results["muonclip"].pop()
 
 if not results:
     raise ValueError("The discovered log files contain no validation-loss records")
@@ -71,6 +71,8 @@ if not results:
 fig, ax = plt.subplots(figsize=(8, 5.5))
 markers = ["o", "s", "^", "D", "v", "P", "X"]
 colors = plt.get_cmap("tab10").colors
+colors = list(colors)
+colors[2], colors[3] = colors[3], colors[2]
 
 for index, (method, method_results) in enumerate(sorted(results.items())):
     color = colors[index % len(colors)]
@@ -102,11 +104,11 @@ for index, (method, method_results) in enumerate(sorted(results.items())):
     """
 
 ax.set_xscale("log")
-ax.set_xlabel("Learning rate", fontsize=24)
-ax.set_ylabel("Final validation loss", fontsize=24)
-ax.tick_params(axis='both', which='major', labelsize=24)
+ax.set_xlabel("Learning rate", fontsize=28)
+ax.set_ylabel("Final validation loss", fontsize=28)
+ax.tick_params(axis='both', which='major', labelsize=28)
 ax.grid(True, which="both", alpha=0.3)
-ax.legend(fontsize=24, loc="best")
+ax.legend(fontsize=28, loc="best")
 
 # 2. Extract current handles and labels
 handles, labels = plt.gca().get_legend_handles_labels()
@@ -115,10 +117,10 @@ handles, labels = plt.gca().get_legend_handles_labels()
 order = [0,1,3,2]
 
 # 4. Pass the reordered lists to plt.legend()
-plt.legend([handles[idx] for idx in order], [labels[idx] for idx in order], fontsize=14)
+plt.legend([handles[idx] for idx in order], [labels[idx] for idx in order], fontsize=28)
 
 
 plt.tight_layout()
-output_path = PLOT_DIR / "final_val_loss_vs_lr.png"
+output_path = PLOT_DIR / "final_val_loss_vs_lr.pdf"
 plt.savefig(output_path, dpi=150, bbox_inches="tight")
 print(f"\nSaved: {output_path}")

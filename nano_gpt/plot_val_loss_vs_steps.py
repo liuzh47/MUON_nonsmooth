@@ -1,4 +1,6 @@
 import re
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -7,11 +9,14 @@ VAL_RE = re.compile(
     r"(?:[eE][-+]?\d+)?|nan)"
 )
 
+PLOT_DIR = Path(__file__).resolve().parent
+PLOT_DIR = PLOT_DIR / "fineweb" / "small"
+
 methods = [
-    ("muon",     "Muon",      "/mnt/user-data/uploads/muon_1gpu_0_2.log"),
-    ("muonclip", "MuonClip",  "/mnt/user-data/uploads/muonclip_1gpu_0_2.log"),
-    ("spectra",  "SPECTRA",   "/mnt/user-data/uploads/spectra_1gpu_0_2.log"),
-    ("softclip", "Soft Musec","/mnt/user-data/uploads/softclip_1gpu_0_2.log"),
+    ("muon",     "Muon",      PLOT_DIR / "muon_1gpu_0.2.log"),
+    ("muonclip", "MuonClip",  PLOT_DIR / "muonclip_1gpu_0.2.log"),
+    ("spectra",  "SPECTRA",   PLOT_DIR / "spectra_1gpu_0.2.log"),
+    ("softclip", "Soft Musec",PLOT_DIR / "softclip_1gpu_0.2.log"),
 ]
 
 def parse_val_loss(path):
@@ -40,13 +45,13 @@ for i, (key, label, path) in enumerate(methods):
         label=label,
     )
 
-ax.set_xlabel("Steps", fontsize=18)
-ax.set_ylabel("Validation loss", fontsize=18)
-ax.tick_params(axis="both", which="major", labelsize=14)
+ax.set_xlabel("Steps", fontsize=28)
+ax.set_ylabel("Validation loss", fontsize=28)
+ax.tick_params(axis="both", which="major", labelsize=28)
 ax.grid(True, which="both", alpha=0.3)
-ax.legend(fontsize=14, loc="best")
+ax.legend(fontsize=28, loc="best")
 
 plt.tight_layout()
-output_path = "/mnt/user-data/outputs/val_loss_vs_steps.png"
+output_path = PLOT_DIR / "val_loss_vs_steps.pdf"
 plt.savefig(output_path, dpi=150, bbox_inches="tight")
 print(f"Saved: {output_path}")
