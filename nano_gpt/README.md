@@ -49,6 +49,8 @@ python data/cached_fineweb10B.py 9
 
 ```bash
 # Train NanoGPT-Medium on FineWeb with Soft Musec (default settings)
+export MODE=muon
+export ORTH_METHOD=softclip
 python train_gpt_medium.py
 ```
 
@@ -63,48 +65,41 @@ python train_gpt_medium.py
 ### Training examples
 
 ```bash
-# NanoGPT-Small on FineWeb
-python train.py \
-    --model small \
-    --dataset fineweb \
-    --optimizer soft_musec \
-    --lr 0.1 \
-    --clip-threshold 0.1 \
-    --weight-decay 0.3 \
-    --ns-steps 5
+# NanoGPT-Small 
+export MODE=muon
+export ORTH_METHOD=softclip
+python train_gpt.py 
 
-# NanoGPT-Medium on OpenWebText
-python train.py \
-    --model medium \
-    --dataset openwebtext \
-    --optimizer soft_musec \
-    --lr 0.2 \
-    --clip-threshold 0.05 \
-    --weight-decay 0.3 \
-    --ns-steps 5
+# NanoGPT-Medium 
+export MODE=muon
+export ORTH_METHOD=softclip
+python train_gpt_medium.py 
 
-# NanoGPT-Wide on C4
-python train.py \
-    --model wide \
-    --dataset c4 \
-    --optimizer soft_musec \
-    --lr 0.2 \
-    --clip-threshold 0.05 \
-    --weight-decay 0.3 \
-    --ns-steps 5
+
+# NanoGPT-Wide 
+export MODE=muon
+export ORTH_METHOD=softclip
+python train_gpt_wide.py 
 ```
 
 ### Comparing with baselines
 
 ```bash
 # Standard Muon
-python train.py --optimizer muon --lr 0.1
+export MODE=muon
+export ORTH_METHOD=vanilla_muon_no_triton
+python train_gpt_medium.py
 
 # MuonClip
-python train.py --optimizer muonclip --lr 0.1
+export MODE=muon
+export USE_MUONCLIP=true
+export ORTH_METHOD=vanilla_muon_no_triton
+python train_gpt_medium.py
 
 # SPECTRA (SGDM + spectral clipping)
-python train.py --optimizer spectra --lr 0.1 --clip-threshold 0.05
+export MODE=muon
+export ORTH_METHOD=spectra
+python train_gpt_medium.py
 ```
 
 ## Repository structure
