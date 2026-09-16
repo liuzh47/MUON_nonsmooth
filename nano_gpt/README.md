@@ -122,11 +122,16 @@ nano_gpt/
 ├── train_gpt_wide.py        # Training script for NanoGPT-Wide
 ├── triton_kernels.py
 ├── plot_res/
-    ├── plot_bank_vs_steps.py      # Plot weight bank vs steps
-    ├── plot_erank.py              # Plot effective rank
-    ├── plot_final_val_loss_vs_lr.py  # Plot learning rate sweep result
-    └── ...
-
+│   ├── plot_bank_vs_steps.py      # Plot weight bank vs steps
+│   ├── plot_erank.py              # Plot effective rank
+│   ├── plot_final_val_loss_vs_lr.py  # Plot learning rate sweep result
+│   └── ...
+├── data/
+    ├── cached_fineweb100B.py
+    ├── cached_fineweb10B.py
+    ├── cached_finewebedu10B.py
+    ├── fineweb.py
+    ├── requirements.txt
 ```
 
 ## Results
